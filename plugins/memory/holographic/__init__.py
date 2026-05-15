@@ -338,6 +338,9 @@ class HolographicMemoryProvider(MemoryProvider):
                 "# Prior Session Context (Narrative Thread)\n"
                 "The following working memory was captured from the previous session:\n\n"
                 + self._nt_prev_content
+                + "\n\n_Start your first response by briefly noting what you found above "
+                "from the last session — what was the focus, what were we working on — "
+                "and ask if there's anything to pick up on or continue from there._"
             )
 
         if not self._store:

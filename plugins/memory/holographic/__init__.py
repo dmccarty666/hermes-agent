@@ -245,6 +245,7 @@ class HolographicMemoryProvider(MemoryProvider):
         # Narrative Thread state
         self._nt_enabled = self._config.get("narrative_thread_enabled", True)
         self._nt_file: Path | None = None
+        self._nt_prev_file: Path | None = None  # set by on_session_switch when reading parent
         self._nt_prev_content: str = ""     # prior-session thread content for injection
         self._nt_prev_exists: bool = False  # whether a prior thread file existed
         self._nt_turn_count = 0
@@ -315,14 +316,17 @@ class HolographicMemoryProvider(MemoryProvider):
         )
         self._session_id = session_id
 
-        # Narrative Thread: resolve thread file path
+        # Narrative Thread: resolve thread file path (per-session)
         if self._nt_enabled:
-            nt_file = self._config.get("narrative_thread_file", f"{_hermes_home}/SESSION-THREAD.md")
-            if isinstance(nt_file, str):
-                nt_file = nt_file.replace("$HERMES_HOME", _hermes_home)
-                nt_file = nt_file.replace("${HERMES_HOME}", _hermes_home)
-            self._nt_file = Path(nt_file)
-            self._nt_file.parent.mkdir(parents=True, exist_ok=True)
+            nt_dir = self._config.get("narrative_thread_dir", f"{_hermes_home}/SESSION-THREAD")
+            if isinstance(nt_dir, str):
+                nt_dir = nt_dir.replace("$HERMES_HOME", _hermes_home)
+                nt_dir = nt_dir.replace("${HERMES_HOME}", _hermes_home)
+            nt_dir = Path(nt_dir)
+            nt_dir.mkdir(parents=True, exist_ok=True)
+            # Per-session file so each session's thread is independent
+            self._nt_file = nt_dir / f"{session_id}.md"
+            self._nt_prev_file = None  # cleared on each init; set by on_session_switch if needed
             self._nt_session_start = _timestamp_cdt()
             self._nt_turn_count = 0
             self._nt_exchanges = []
@@ -458,10 +462,21 @@ class HolographicMemoryProvider(MemoryProvider):
             self._nt_first_turn_done = False
             self._nt_session_start = _timestamp_cdt()
         else:
-            # /resume or /branch — read the prior session's thread for context injection
-            if self._nt_file and self._nt_file.exists():
+            # /resume (same session) or /branch/provider-switch (new session with
+            # parent_session_id): read the prior thread so system_prompt_block can
+            # inject it as "Prior Session Context" before the first turn runs.
+            _prior_file: Path | None = None
+            if parent_session_id and self._nt_file:
+                # Parent session is known — read its per-session thread file
+                _parent_dir = self._nt_file.parent
+                _prior_file = _parent_dir / f"{parent_session_id}.md"
+            elif self._nt_file and self._nt_file.exists():
+                # No parent (same-session resume via stored_prompt) — read current file
+                _prior_file = self._nt_file
+
+            if _prior_file and _prior_file.exists():
                 try:
-                    self._nt_prev_content = self._nt_file.read_text("utf-8")
+                    self._nt_prev_content = _prior_file.read_text("utf-8")
                     self._nt_prev_exists = True
                 except Exception:
                     self._nt_prev_content = ""

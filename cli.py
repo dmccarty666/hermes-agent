@@ -5613,17 +5613,18 @@ class HermesCLI:
                         _cprint("  Title is empty after cleanup — session started untitled.")
                         title = None
             # Notify memory providers that session_id rotated to a fresh
-            # conversation. reset=True signals providers to flush accumulated
-            # per-session state (_session_turns, _turn_counter, _document_id).
-            # Fires BEFORE the plugin on_session_reset hook (shell hooks only
-            # see the new id; Python providers see the transition). See #6672.
+            # conversation. reset=False (NOT True) keeps the narrative thread
+            # alive so the new session can announce prior context and ask whether
+            # to continue.  Per-session state (_session_turns, _turn_counter,
+            # _document_id) is flushed via provider.reset_session_state() above.
+            # See #6672 / narrative-thread design.
             try:
                 _mm = getattr(self.agent, "_memory_manager", None)
                 if _mm is not None:
                     _mm.on_session_switch(
                         self.session_id,
                         parent_session_id=old_session_id or "",
-                        reset=True,
+                        reset=False,
                         reason="new_session",
                     )
             except Exception:

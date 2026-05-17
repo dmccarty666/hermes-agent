@@ -11926,6 +11926,22 @@ class AIAgent:
                 # Continuing session — reuse the exact system prompt from
                 # the previous turn so the Anthropic cache prefix matches.
                 self._cached_system_prompt = stored_prompt
+                # Narrative Thread: the prior SESSION-THREAD.md must be read
+                # and injected into the system prompt block before the first
+                # turn of a resumed conversation runs.  Fire the read path
+                # (reset=False) so the holographic provider loads the prior
+                # thread into _nt_prev_content for system_prompt_block().
+                if self._memory_manager and self.session_id:
+                    try:
+                        self._memory_manager.on_session_switch(
+                            self.session_id,
+                            reset=False,
+                            reason="session_resume",
+                        )
+                    except Exception:
+                        logger.debug(
+                            "memory manager on_session_switch (resume): %s", _
+                        )
             else:
                 # First turn of a new session — build from scratch.
                 self._cached_system_prompt = self._build_system_prompt(system_message)

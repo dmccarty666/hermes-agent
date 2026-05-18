@@ -17,6 +17,8 @@ from datetime import date, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TextIO
 
+from hermes_memory_core.schema import validate_event
+
 logger = logging.getLogger(__name__)
 
 _MEMORY_BASE = "memory"  # under $HERMES_HOME
@@ -69,6 +71,18 @@ class FSStore:
             )
         )
         return hashlib.sha256(canonical.encode()).hexdigest()
+
+    # ------------------------------------------------------------------
+    # Schema validation (delegated to hermes_memory_core.schema)
+    # ------------------------------------------------------------------
+
+    def validate_event(self, event: Dict[str, Any]) -> None:
+        """Validate an event dict against the canonical schema.
+
+        Raises:
+            EventValidationError: if the event is invalid.
+        """
+        validate_event(event)
 
     def _jsonl_path(self, session_id: str, date_str: Optional[str] = None) -> Path:
         """Return the JSONL path for a session on a given date.

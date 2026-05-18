@@ -97,7 +97,8 @@ def _health() -> str:
         from hermes_memory_core.write.redaction import Redactor
 
         scanner = Redactor()
-        result = scanner.scan("test_AKIAIOSFODNN7EXAMPLE_test")
+        # Realistic AWS key format: AKIA prefix + exactly 16 uppercase alphanumeric
+        result = scanner.scan("test_AKIAIOSFODNN7EXAMPLEX_test")
         if result.fired:
             types_seen = sorted({h.pattern_name for h in result.hits})
             lines.append(f"redaction    : available ({len(types_seen)} types: {', '.join(types_seen)})")

@@ -25,19 +25,24 @@ logger = logging.getLogger(__name__)
 
 _PATTERNS: List[tuple[str, re.Pattern]] = [
     # AWS Access Key: AKIA + 16 uppercase alphanumeric chars
+    # Uses explicit lookaround instead of \b to handle keys embedded in text
+    # with underscores/prefixes/suffixes (e.g. test_AKIA...X_test)
     (
         "aws_access_key",
-        re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+        re.compile(r"(?<![A-Za-z0-9])AKIA[0-9A-Z]{16}(?![A-Za-z0-9])"),
     ),
     # Anthropic key: sk-ant- followed by 20+ chars (before openai_key)
+    # Uses explicit lookaround to handle underscore-prefixed keys
     (
         "anthropic_key",
-        re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b"),
+        re.compile(r"(?<![A-Za-z0-9])sk-ant-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9])"),
     ),
     # OpenAI key: sk- followed by 20+ alphanumeric/hyphen/underscore
+    # Uses explicit lookaround instead of \b to handle underscore-prefixed keys
+    # (e.g. /tmp/upload_sk-... would fail \b because _ and s are both word chars)
     (
         "openai_key",
-        re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
+        re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9])"),
     ),
     # GitHub token: ghp_/gho_/ghs_/ghu_/ghr_/github_pat_ + sufficient chars
     (

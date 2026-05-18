@@ -40,7 +40,7 @@ def _reload_semantic_search():
     return _s
 
 
-# --------------------------------------------------------------------------- #
+# -------------------------------------------------------------------------- #
 # Mode weight tables (exposed for tests)
 # ---------------------------------------------------------------------------#
 
@@ -55,7 +55,7 @@ _MODE_WEIGHTS: Dict[str, Dict[str, float]] = {
 _DEFAULT_WEIGHTS = {"fts": 0.30, "qdrant": 0.40, "jaccard": 0.15, "hrr": 0.15}
 
 
-# --------------------------------------------------------------------------- #
+# -------------------------------------------------------------------------- #
 # ScoredResult
 # ---------------------------------------------------------------------------#
 
@@ -64,7 +64,7 @@ class ScoredResult:
     """A retrieval result with its hybrid score breakdown."""
     chunk_id: str
     session_id: str
-    text: str = ""          # searchable content
+    content: str = ""           # searchable text
     score: float = 0.0
     fts_score: float = 0.0
     qdrant_score: float = 0.0
@@ -74,26 +74,31 @@ class ScoredResult:
     backend_hits: List[str] = field(default_factory=list)
     trust_score: float = 1.0
     freshness_decay: float = 1.0
+    source_ref: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to a plain dict for API responses."""
         return {
             "chunk_id": self.chunk_id,
             "session_id": self.session_id,
-            "content": self.text,
+            "content": self.content,
             "score": self.score,
             "fts_score": self.fts_score,
             "qdrant_score": self.qdrant_score,
             "jaccard_score": self.jaccard_score,
             "hrr_score": self.hrr_score,
-            "rank": self.rank,
-            "backend_hits": list(self.backend_hits),
-            "source_ref": f"session:{self.session_id}#chunk={self.chunk_id}",
-            "metadata": {"trust": self.trust_score, "freshness_decay": self.freshness_decay},
+            "backend_hits": self.backend_hits,
+            "source_ref": self.source_ref,
+            "metadata": {
+                "trust": self.trust_score,
+                "freshness_decay": self.freshness_decay,
+                **self.metadata,
+            },
         }
 
 
-# --------------------------------------------------------------------------- #
+# -------------------------------------------------------------------------- #
 # Freshness decay (exposed for tests)
 # ---------------------------------------------------------------------------#
 
@@ -115,7 +120,7 @@ def freshness_decay(updated_at: Optional[str], half_life_days: float = 90.0) -> 
     return 0.5 ** (age_days / half_life_days) if half_life_days else 1.0
 
 
-# --------------------------------------------------------------------------- #
+# -------------------------------------------------------------------------- #
 # Jaccard similarity (exposed for tests)
 # ---------------------------------------------------------------------------#
 
@@ -142,27 +147,26 @@ def jaccard_similarity(query: str, content: str) -> float:
     return intersection / union if union else 0.0
 
 
-# --------------------------------------------------------------------------- #
+# -------------------------------------------------------------------------- #
 # Content hash (dedup key)
 # ---------------------------------------------------------------------------#
 
 def _content_hash(text: str) -> str:
-    """Compute 16-char SHA-256 hex digest of text for dedup key."""
+    """Compute SHA-256 hex digest of text for dedup key; truncated to 16 hex chars."""
     return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()[:16]
 
 
-# --------------------------------------------------------------------------- #
+# -------------------------------------------------------------------------- #
 # Backend score normalization
 # ---------------------------------------------------------------------------#
 
 def _normalize_bm25(bm25_score: float) -> float:
     """Convert FTS5 BM25 (lower is better) to [0, 1] similarity.
 
-    BM25 is negative for ranked results; zero or positive means perfect match.
-    The scale maps abs(-20) to 0 (worst), abs(0) to 1 (best).
-    Clamped to [0, 1] always.
+    BM25 is negative (more negative = worse); 0 is a perfect match.
+    Positive scores are clamped to 1.0.
     """
-    if bm25_score >= 0:
+    if bm25_score >= 0.0:
         return 1.0
     abs_score = abs(bm25_score)
     scale = 20.0
@@ -174,7 +178,7 @@ def _normalize_qdrant(score: float) -> float:
     return max(0.0, min(1.0, score))
 
 
-# --------------------------------------------------------------------------- #
+# -------------------------------------------------------------------------- #
 # Per-backend search functions (exposed for mocking)
 # ---------------------------------------------------------------------------#
 
@@ -186,9 +190,9 @@ def _search_fts(
 ) -> List[Dict[str, Any]]:
     """Call fts5_search against the chunks table."""
     global fts5_search
+    if fts5_search is None:
+        fts5_search = _reload_fts5_search()
     try:
-        if fts5_search is None:
-            fts5_search = _reload_fts5_search()
         return fts5_search(
             query=query,
             filters=filters,
@@ -208,16 +212,16 @@ def _search_qdrant(
 ) -> List[Dict[str, Any]]:
     """Call semantic_search against Qdrant."""
     global semantic_search
+    if semantic_search is None:
+        semantic_search = _reload_semantic_search()
     try:
-        if semantic_search is None:
-            semantic_search = _reload_semantic_search()
         return semantic_search(query=query, filters=filters, limit=limit)
     except Exception as exc:
         logger.warning("Qdrant search failed: %s", exc)
         return []
 
 
-# --------------------------------------------------------------------------- #
+# -------------------------------------------------------------------------- #
 # Hybrid scorer logic
 # ---------------------------------------------------------------------------#
 
@@ -249,22 +253,13 @@ def _deduplicate(results: List[ScoredResult]) -> List[ScoredResult]:
     """
     seen: Dict[str, ScoredResult] = {}
     for r in results:
-        key = f"{r.chunk_id}:{r.session_id}:{_content_hash(r.text)}"
+        key = f"{r.chunk_id}:{r.session_id}:{_content_hash(r.content)}"
         if key not in seen:
             seen[key] = r
         else:
             existing = seen[key]
             if r.score > existing.score:
-                # Update all score fields to new winner's values
-                existing.text = r.text
-                existing.score = r.score
-                existing.fts_score = r.fts_score
-                existing.qdrant_score = r.qdrant_score
-                existing.jaccard_score = r.jaccard_score
-                existing.hrr_score = r.hrr_score
-                existing.trust_score = r.trust_score
-                existing.freshness_decay = r.freshness_decay
-            # Always merge backend_hits from incoming result
+                seen[key] = r
             for hit in r.backend_hits:
                 if hit not in existing.backend_hits:
                     existing.backend_hits.append(hit)
@@ -289,6 +284,7 @@ def _dedup_results(
         chunk_id = hit.get("chunk_id", hit.get("turn_id", ""))
         session_id = hit.get("session_id", "")
         content = hit.get("chunk_text") or hit.get("content", "")
+        source_ref = hit.get("source_ref", f"chunk:{chunk_id}")
         raw_score = hit.get("rank", 0.0)
         fts_norm = _normalize_bm25(raw_score)
         updated_at = hit.get("timestamp")
@@ -298,15 +294,15 @@ def _dedup_results(
             candidates[key] = ScoredResult(
                 chunk_id=chunk_id,
                 session_id=session_id,
-                text=content,
+                content=content,
                 score=0.0,
                 fts_score=fts_norm,
                 qdrant_score=0.0,
                 jaccard_score=0.0,
                 hrr_score=0.0,
                 backend_hits=["fts"],
-                trust_score=1.0,
-                freshness_decay=freshness_decay(updated_at) if updated_at else 1.0,
+                source_ref=source_ref,
+                metadata={"timestamp": updated_at, "backend": "fts"},
             )
         else:
             existing = candidates[key]
@@ -320,6 +316,7 @@ def _dedup_results(
         chunk_id = hit.get("metadata", {}).get("chunk_id", "")
         session_id = hit.get("metadata", {}).get("session_id", "")
         content = hit.get("content", "")
+        source_ref = hit.get("source_ref", f"chunk:{chunk_id}")
         qdrant_score = _normalize_qdrant(hit.get("score", 0.0))
         updated_at = hit.get("metadata", {}).get("date")
 
@@ -328,15 +325,15 @@ def _dedup_results(
             candidates[key] = ScoredResult(
                 chunk_id=chunk_id,
                 session_id=session_id,
-                text=content,
+                content=content,
                 score=0.0,
                 fts_score=0.0,
                 qdrant_score=qdrant_score,
                 jaccard_score=0.0,
                 hrr_score=0.0,
                 backend_hits=["qdrant"],
-                trust_score=1.0,
-                freshness_decay=freshness_decay(updated_at) if updated_at else 1.0,
+                source_ref=source_ref,
+                metadata={"date": updated_at, "backend": "qdrant"},
             )
         else:
             existing = candidates[key]
@@ -348,7 +345,7 @@ def _dedup_results(
     return candidates
 
 
-# --------------------------------------------------------------------------- #
+# -------------------------------------------------------------------------- #
 # Trust score helper
 # ---------------------------------------------------------------------------#
 
@@ -368,8 +365,8 @@ def _fetch_trust(memory_db: Any, chunk_id: str) -> float:
     return 1.0
 
 
-# --------------------------------------------------------------------------- #
-# Public API
+# -------------------------------------------------------------------------- #
+# Public API — search() function
 # ---------------------------------------------------------------------------#
 
 def search(
@@ -382,12 +379,12 @@ def search(
     """Run hybrid search across FTS + Qdrant + Jaccard + HRR backends.
 
     Returns a dict with:
-        - results: list of result dicts, sorted by combined score
+        - results: list of ScoredResult dicts, sorted by combined score
         - count: number of results
-        - mode: the effective mode used
+        - mode: the mode used
         - query: the original query
+        - backend_weights: the weights used for this mode
         - degraded_modes: list of backends that failed (if any)
-        - backend_weights: the weight dict for the effective mode
 
     Phase 4 Story 4.1.1: integrates fts5_search and semantic_search.
     Jaccard similarity is fully implemented.
@@ -396,11 +393,8 @@ def search(
     filters = filters or {}
     limit = max(1, limit)
     degraded_modes: List[str] = []
+    backend_weights = _MODE_WEIGHTS.get(mode, _DEFAULT_WEIGHTS)
 
-    effective_mode = mode if mode in _MODE_WEIGHTS else "default"
-    backend_weights = dict(_MODE_WEIGHTS[effective_mode])
-
-    # Fetch from each backend
     fts_raw: List[Dict[str, Any]] = []
     qdrant_raw: List[Dict[str, Any]] = []
 
@@ -416,20 +410,17 @@ def search(
         logger.warning("Qdrant backend failed: %s", exc)
         degraded_modes.append("qdrant")
 
-    # Merge candidates
     candidates = _dedup_results(fts_raw, qdrant_raw)
 
-    # Compute final combined score for each candidate
     scored: List[ScoredResult] = []
     for key, result in candidates.items():
-        # Jaccard (fully implemented)
-        result.jaccard_score = jaccard_similarity(query, result.text)
-        # HRR stub
+        result.jaccard_score = jaccard_similarity(query, result.content)
         result.hrr_score = 0.0
-        # Trust from chunks table if available
         if memory_db is not None:
             result.trust_score = _fetch_trust(memory_db, result.chunk_id)
-        # Combined score
+        result.freshness_decay = freshness_decay(
+            result.metadata.get("timestamp") or result.metadata.get("date")
+        )
         result.score = _score(
             fts_norm=result.fts_score,
             qdrant_norm=result.qdrant_score,
@@ -437,30 +428,21 @@ def search(
             hrr_sim=result.hrr_score,
             trust_score=result.trust_score,
             freshness=result.freshness_decay,
-            mode=effective_mode,
+            mode=mode,
         )
         scored.append(result)
 
-    # Dedup
     deduped = _deduplicate(scored)
-
-    # Sort descending by combined score
     deduped.sort(key=lambda r: r.score, reverse=True)
-
-    # Assign ranks
-    for i, r in enumerate(deduped):
-        r.rank = i + 1
-
-    # Trim to limit
     results_out = [r.to_dict() for r in deduped[:limit]]
 
     return {
         "results": results_out,
         "count": len(results_out),
-        "mode": effective_mode,
+        "mode": mode,
         "query": query,
-        "degraded_modes": degraded_modes,
         "backend_weights": backend_weights,
+        "degraded_modes": degraded_modes,
     }
 
 
@@ -468,17 +450,25 @@ def search(
 hybrid_search = search
 
 
-# --------------------------------------------------------------------------- #
+# -------------------------------------------------------------------------- #
 # HybridScorer (backwards-compatible class wrapper)
 # ---------------------------------------------------------------------------#
 
 class HybridScorer:
-    """Hybrid scorer class with instance-level dedup and mode methods.
+    """Backwards-compatible hybrid scorer class.
 
-    For the canonical module-level search() function, use search().
+    Wraps the module-level :func:`search` function. New code should use
+    ``hybrid_search(query, mode, filters, limit, memory_db)`` directly.
     """
 
-    _MODE_WEIGHTS = _MODE_WEIGHTS  # class-level reference to module dict
+    # Class-level weight table (for test compatibility)
+    _MODE_WEIGHTS: Dict[str, Dict[str, float]] = {
+        "default":    {"fts": 0.30, "qdrant": 0.40, "jaccard": 0.15, "hrr": 0.15},
+        "keyword":    {"fts": 0.70, "qdrant": 0.10, "jaccard": 0.20, "hrr": 0.00},
+        "semantic":   {"fts": 0.05, "qdrant": 0.80, "jaccard": 0.10, "hrr": 0.05},
+        "hybrid":     {"fts": 0.30, "qdrant": 0.40, "jaccard": 0.15, "hrr": 0.15},
+        "facts_only": {"fts": 0.40, "qdrant": 0.30, "jaccard": 0.15, "hrr": 0.15},
+    }
 
     def __init__(
         self,
@@ -492,46 +482,6 @@ class HybridScorer:
         self.jaccard_weight = jaccard_weight
         self.hrr_weight = hrr_weight
 
-    def _mode_weights(self, mode: str) -> Dict[str, float]:
-        """Return weight dict for given mode, falling back to default."""
-        return _MODE_WEIGHTS.get(mode, _DEFAULT_WEIGHTS)
-
-    def _redistribute_weights(
-        self, weights: Dict[str, float], dead_backends: List[str]
-    ) -> Dict[str, float]:
-        """Redistribute weight from dead backends proportionally to alive ones."""
-        alive = {k: v for k, v in weights.items() if k not in dead_backends}
-        if not alive:
-            return {"fts": 0.25, "qdrant": 0.25, "jaccard": 0.25, "hrr": 0.25}
-        total = sum(alive.values())
-        if total == 0:
-            return {k: 1.0 / len(alive) for k in alive}
-        return {k: v / total for k, v in alive.items()}
-
-    def _freshness_decay(
-        self, updated_at: Optional[str], half_life_days: float = 90.0
-    ) -> float:
-        """Apply freshness decay; delegates to module-level function."""
-        return freshness_decay(updated_at, half_life_days)
-
-    def _deduplicate(self, results: List[ScoredResult]) -> List[ScoredResult]:
-        """Instance method wrapping module-level _deduplicate."""
-        return _deduplicate(results)
-
-    def _combined_score(
-        self,
-        fts_score: float,
-        qdrant_score: float,
-        jaccard_score: float,
-        hrr_score: float,
-        trust_score: float,
-        freshness_decay: float,
-        mode: str,
-    ) -> float:
-        """Compute weighted combined score."""
-        return _score(fts_score, qdrant_score, jaccard_score, hrr_score,
-                      trust_score, freshness_decay, mode)
-
     def search(
         self,
         query: str,
@@ -542,5 +492,34 @@ class HybridScorer:
     ) -> List[ScoredResult]:
         """Run hybrid search. Returns list of ScoredResult (not wrapped dict)."""
         result = search(query=query, mode=mode, filters=filters,
-                       limit=limit, memory_db=memory_db)
+                        limit=limit, memory_db=memory_db)
         return [ScoredResult(**r) for r in result["results"]]
+
+    def _freshness_decay(self, updated_at: Optional[str], half_life_days: float = 90.0) -> float:
+        """Instance method wrapper around module-level freshness_decay."""
+        return freshness_decay(updated_at, half_life_days)
+
+    def _deduplicate(self, results: List[ScoredResult]) -> List[ScoredResult]:
+        """Instance method wrapper around module-level _deduplicate."""
+        return _deduplicate(results)
+
+    def _combined_score(
+        self,
+        fts_score: float,
+        qdrant_score: float,
+        jaccard_score: float,
+        hrr_score: float,
+        trust_score: float,
+        freshness_decay: float,
+        mode: str = "hybrid",
+    ) -> float:
+        """Compute weighted combined score = sum(w * norm) * trust * freshness."""
+        return _score(
+            fts_norm=fts_score,
+            qdrant_norm=qdrant_score,
+            jaccard_sim=jaccard_score,
+            hrr_sim=hrr_score,
+            trust_score=trust_score,
+            freshness=freshness_decay,
+            mode=mode,
+        )

@@ -81,7 +81,8 @@ CREATE TABLE IF NOT EXISTS turns (
   parent_turn_id       TEXT,
   redaction_count      INTEGER NOT NULL DEFAULT 0,
   redaction_summary    TEXT,
-  redaction_applied    TEXT
+  redaction_applied    TEXT,
+  redaction_types_json TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, sequence);
@@ -258,65 +259,66 @@ CREATE VIRTUAL TABLE IF NOT EXISTS decisions_fts USING fts5(
 """
 
 # Triggers to keep FTS5 in sync with base tables
+# Named {base_table}_fts_{op} to match test expectations (TDD §6.2)
 _CREATE_TRIGGERS = """
-CREATE TRIGGER IF NOT EXISTS turns_ai AFTER INSERT ON turns BEGIN
+CREATE TRIGGER IF NOT EXISTS turns_fts_ai AFTER INSERT ON turns BEGIN
   INSERT INTO turns_fts(rowid, content) VALUES (NEW.rowid, NEW.content);
 END;
 
-CREATE TRIGGER IF NOT EXISTS turns_ad AFTER DELETE ON turns BEGIN
+CREATE TRIGGER IF NOT EXISTS turns_fts_ad AFTER DELETE ON turns BEGIN
   INSERT INTO turns_fts(turns_fts, rowid, content)
     VALUES('delete', OLD.rowid, OLD.content);
 END;
 
-CREATE TRIGGER IF NOT EXISTS turns_au AFTER UPDATE ON turns BEGIN
+CREATE TRIGGER IF NOT EXISTS turns_fts_au AFTER UPDATE ON turns BEGIN
   INSERT INTO turns_fts(turns_fts, rowid, content)
     VALUES('delete', OLD.rowid, OLD.content);
   INSERT INTO turns_fts(rowid, content) VALUES (NEW.rowid, NEW.content);
 END;
 
-CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
+CREATE TRIGGER IF NOT EXISTS chunks_fts_ai AFTER INSERT ON chunks BEGIN
   INSERT INTO chunks_fts(rowid, chunk_text)
     VALUES (NEW.rowid, NEW.chunk_text);
 END;
 
-CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
+CREATE TRIGGER IF NOT EXISTS chunks_fts_ad AFTER DELETE ON chunks BEGIN
   INSERT INTO chunks_fts(chunks_fts, rowid, chunk_text)
     VALUES('delete', OLD.rowid, OLD.chunk_text);
 END;
 
-CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
+CREATE TRIGGER IF NOT EXISTS chunks_fts_au AFTER UPDATE ON chunks BEGIN
   INSERT INTO chunks_fts(chunks_fts, rowid, chunk_text)
     VALUES('delete', OLD.rowid, OLD.chunk_text);
   INSERT INTO chunks_fts(rowid, chunk_text)
     VALUES (NEW.rowid, NEW.chunk_text);
 END;
 
-CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
+CREATE TRIGGER IF NOT EXISTS facts_fts_ai AFTER INSERT ON facts BEGIN
   INSERT INTO facts_fts(rowid, fact_text) VALUES (NEW.rowid, NEW.fact_text);
 END;
 
-CREATE TRIGGER IF NOT EXISTS facts_ad AFTER DELETE ON facts BEGIN
+CREATE TRIGGER IF NOT EXISTS facts_fts_ad AFTER DELETE ON facts BEGIN
   INSERT INTO facts_fts(facts_fts, rowid, fact_text)
     VALUES('delete', OLD.rowid, OLD.fact_text);
 END;
 
-CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts BEGIN
+CREATE TRIGGER IF NOT EXISTS facts_fts_au AFTER UPDATE ON facts BEGIN
   INSERT INTO facts_fts(facts_fts, rowid, fact_text)
     VALUES('delete', OLD.rowid, OLD.fact_text);
   INSERT INTO facts_fts(rowid, fact_text) VALUES (NEW.rowid, NEW.fact_text);
 END;
 
-CREATE TRIGGER IF NOT EXISTS decisions_ai AFTER INSERT ON decisions BEGIN
+CREATE TRIGGER IF NOT EXISTS decisions_fts_ai AFTER INSERT ON decisions BEGIN
   INSERT INTO decisions_fts(rowid, decision_text)
     VALUES (NEW.rowid, NEW.decision_text);
 END;
 
-CREATE TRIGGER IF NOT EXISTS decisions_ad AFTER DELETE ON decisions BEGIN
+CREATE TRIGGER IF NOT EXISTS decisions_fts_ad AFTER DELETE ON decisions BEGIN
   INSERT INTO decisions_fts(decisions_fts, rowid, decision_text)
     VALUES('delete', OLD.rowid, OLD.decision_text);
 END;
 
-CREATE TRIGGER IF NOT EXISTS decisions_au AFTER UPDATE ON decisions BEGIN
+CREATE TRIGGER IF NOT EXISTS decisions_fts_au AFTER UPDATE ON decisions BEGIN
   INSERT INTO decisions_fts(decisions_fts, rowid, decision_text)
     VALUES('delete', OLD.rowid, OLD.decision_text);
   INSERT INTO decisions_fts(rowid, decision_text)

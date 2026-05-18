@@ -7173,6 +7173,25 @@ class HermesCLI:
         except Exception as exc:
             print(f"(._.) curator: {exc}")
 
+    def _handle_memory_command(self, cmd: str):
+        """Handle the /memory command — delegates to hermes_cli.memory.run_slash."""
+        from hermes_cli.memory import run_slash
+
+        rest = cmd.strip()
+        if rest.startswith("/"):
+            rest = rest.lstrip("/")
+        if rest.startswith("memory"):
+            rest = rest[len("memory"):].lstrip()
+
+        try:
+            output = run_slash(rest)
+            print(output)
+        except SystemExit:
+            # argparse --help calls sys.exit(); swallow it
+            pass
+        except Exception as exc:
+            print(f"(._.) memory: {exc}")
+
     def _handle_kanban_command(self, cmd: str):
         """Handle the /kanban command — delegate to the shared kanban CLI.
 
@@ -7465,6 +7484,8 @@ class HermesCLI:
             self._handle_curator_command(cmd_original)
         elif canonical == "kanban":
             self._handle_kanban_command(cmd_original)
+        elif canonical == "memory":
+            self._handle_memory_command(cmd_original)
         elif canonical == "skills":
             with self._busy_command(self._slow_command_status(cmd_original)):
                 self._handle_skills_command(cmd_original)

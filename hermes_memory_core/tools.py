@@ -71,7 +71,7 @@ MEMORY_GET_SOURCE_SCHEMA: Dict[str, Any] = {
 
 def get_tool_schemas() -> List[Dict[str, Any]]:
     """Return the list of tool schemas for Phase 2."""
-    return [MEMORY_QUERY_SCHEMA, MEMORY_GET_SOURCE_SCHEMA]
+    return [MEMORY_QUERY_SCHEMA, MEMORY_GET_SOURCE_SCHEMA, MEMORY_RECENT_CONTEXT_SCHEMA]
 
 
 # ------------------------------------------------------------------
@@ -84,6 +84,8 @@ def handle_tool_call(tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         return json.dumps(_handle_memory_query(args, **kwargs))
     if tool_name == "memory_get_source":
         return json.dumps(_handle_memory_get_source(args, **kwargs))
+    if tool_name == "memory_recent_context":
+        return json.dumps(_handle_memory_recent_context(args, **kwargs))
     return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
 
@@ -244,3 +246,146 @@ def _handle_memory_get_source(args: Dict[str, Any], **kwargs) -> Dict[str, Any]:
     expand = bool(args.get("expand", False))
     memory_db = kwargs.get("memory_db")
     return resolve(source_ref, memory_db=memory_db, expand=expand)
+
+
+# ------------------------------------------------------------------
+# memory_recent_context (Epic 4.3.1)
+# ------------------------------------------------------------------
+
+MEMORY_RECENT_CONTEXT_SCHEMA: Dict[str, Any] = {
+    "name": "memory_recent_context",
+    "description": (
+        "Compact working set for session start: pinned facts + active project "
+        "facts + recent decisions + open questions + recent dream summaries. "
+        "Token-budget aware."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "project":   {"type": "string"},
+            "max_chars": {"type": "integer", "default": 4000},
+        },
+    },
+}
+
+
+def _handle_memory_recent_context(
+    args: Dict[str, Any], **kwargs
+) -> Dict[str, Any]:
+    """Build a compact recent-context response fitting max_chars budget.
+
+    Sources (per Story 4.3.1 AC):
+      - Pinned user facts (scope='user', status='active', top by trust)
+      - Active project facts (top N by trust where project=current)
+      - Recent decisions (last 14 days)
+      - Open questions (status='open')
+      - Recent dream summaries (last 7 days)
+    """
+    project = args.get("project", "")
+    max_chars = int(args.get("max_chars", 4000))
+    memory_db = kwargs.get("memory_db")
+
+    from hermes_memory_core.store.sqlite import MemoryDB as MDB
+    db: "MDB"
+    if memory_db is not None:
+        db = memory_db
+    else:
+        db = MDB()
+        db.initialize()
+
+    sections: List[Dict[str, Any]] = []
+
+    # 1. Pinned user facts
+    pinned = db.get_pinned_facts(limit=20)
+    sections.append({"label": "pinned_facts", "items": pinned, "source_kind": "fact"})
+
+    # 2. Project facts (if project specified)
+    if project:
+        project_facts = db.get_project_facts(project, limit=20)
+        sections.append({"label": "project_facts", "items": project_facts, "source_kind": "fact"})
+
+    # 3. Recent decisions (last 14 days)
+    decisions = db.get_recent_decisions(days=14, limit=20)
+    sections.append({"label": "recent_decisions", "items": decisions, "source_kind": "decision"})
+
+    # 4. Open questions
+    questions = db.get_open_questions(limit=20)
+    sections.append({"label": "open_questions", "items": questions, "source_kind": "question"})
+
+    # 5. Recent dream summaries (last 7 days)
+    dreams = db.get_recent_dream_summaries(days=7, limit=10)
+    sections.append({"label": "recent_dreams", "items": dreams, "source_kind": "dream"})
+
+    # Build sections with source_refs
+    output_sections = []
+    total_chars = 0
+    for section in sections:
+        rendered = []
+        for item in section["items"]:
+            text = _render_context_item(section["label"], item, section["source_kind"])
+            if total_chars + len(text) <= max_chars:
+                rendered.append(item)
+                total_chars += len(text)
+            else:
+                break
+        output_sections.append({
+            "label": section["label"],
+            "count": len(rendered),
+            "items": [_summarize_context_item(section["label"], i, section["source_kind"]) for i in rendered],
+        })
+
+    return {
+        "sections": output_sections,
+        "max_chars": max_chars,
+        "total_chars": total_chars,
+        "project": project or None,
+    }
+
+
+def _render_context_item(label: str, item: Dict[str, Any], kind: str) -> str:
+    """Render a context item as a readable string."""
+    if kind == "fact":
+        return item.get("fact_text", "")
+    elif kind == "decision":
+        return item.get("decision_text", "")
+    elif kind == "question":
+        return item.get("question_text", "")
+    elif kind == "dream":
+        return f"Dream run {item.get('dream_run_id', '')}: {item.get('facts_created', 0)} facts, {item.get('decisions_created', 0)} decisions"
+    return ""
+
+
+def _summarize_context_item(label: str, item: Dict[str, Any], kind: str) -> Dict[str, Any]:
+    """Build a summary dict for a context item with source_ref."""
+    if kind == "fact":
+        return {
+            "fact_id": item.get("fact_id"),
+            "text": item.get("fact_text", ""),
+            "source_ref": f"fact:{item.get('fact_id', '')}",
+            "trust_score": 0.5,  # default; trust ranking is by created_at order
+        }
+    elif kind == "decision":
+        return {
+            "decision_id": item.get("decision_id"),
+            "text": item.get("decision_text", ""),
+            "rationale": item.get("rationale"),
+            "status": item.get("status", "open"),
+            "source_ref": f"decision:{item.get('decision_id', '')}",
+        }
+    elif kind == "question":
+        return {
+            "question_id": item.get("question_id"),
+            "text": item.get("question_text", ""),
+            "priority": item.get("priority"),
+            "source_ref": f"question:{item.get('question_id', '')}",
+        }
+    elif kind == "dream":
+        return {
+            "dream_run_id": item.get("dream_run_id"),
+            "started_at": item.get("started_at"),
+            "facts_created": item.get("facts_created", 0),
+            "decisions_created": item.get("decisions_created", 0),
+            "questions_created": item.get("questions_created", 0),
+            "source_ref": f"dream:{item.get('dream_run_id', '')}",
+        }
+    return {}

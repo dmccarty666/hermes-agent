@@ -1,8 +1,8 @@
-"""Tools — Phase 2 (story T-002).
+"""Tools — memory_recent_context schema (Epic 4.3.1).
 
-Seven memory tool schemas + dispatch.
-Placeholder until that story is picked up.
+Re-exports schemas from hermes_memory_core for the plugin layer.
 """
 
-# TODO: memory_query, memory_write, memory_browse, memory_facts,
-#       memory_decisions, memory_questions, memory_recent_context
+from hermes_memory_core.tools import get_tool_schemas
+
+__all__ = ["get_tool_schemas"]

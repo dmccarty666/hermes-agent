@@ -145,10 +145,11 @@ def test_get_tool_schemas_returns_memory_query_schema(tmp_path: Path, monkeypatc
 
     provider = module.HermesLocalProvider()
     schemas = provider.get_tool_schemas()
-    assert len(schemas) == 2, f"Expected 2 schemas for Phase 4, got {len(schemas)}: {schemas}"
+    assert len(schemas) == 3, f"Expected 3 schemas for Phase 4, got {len(schemas)}: {schemas}"
     names = {s["name"] for s in schemas}
     assert "memory_query" in names, f"memory_query schema missing, got: {names}"
     assert "memory_get_source" in names, f"memory_get_source schema missing, got: {names}"
+    assert "memory_recent_context" in names, f"memory_recent_context schema missing, got: {names}"
 
 
 # ---------------------------------------------------------------------------

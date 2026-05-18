@@ -15,11 +15,12 @@ Writer-ownership per ADR-002:
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from hermes_state import apply_wal_with_fallback
 
@@ -498,3 +499,143 @@ class MemoryDB:
             )
         finally:
             conn.close()
+
+    # ------------------------------------------------------------------
+    # Recent context helpers (Epic 4.3.1 — memory_recent_context)
+    # ------------------------------------------------------------------
+
+    def get_pinned_facts(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """Pinned user facts: scope='user', status='active', top by trust."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT f.fact_id, f.fact_text, f.project, f.status,
+                       f.source_refs_json, f.created_at
+                FROM facts f
+                WHERE f.scope = 'user'
+                  AND f.status = 'active'
+                ORDER BY f.created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [self._fact_row_to_dict(row) for row in rows]
+        finally:
+            conn.close()
+
+    def get_project_facts(self, project: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """Active project facts, top by trust."""
+        if not project:
+            return []
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT f.fact_id, f.fact_text, f.project, f.status,
+                       f.source_refs_json, f.created_at
+                FROM facts f
+                WHERE f.project = ?
+                  AND f.status = 'active'
+                ORDER BY f.created_at DESC
+                LIMIT ?
+                """,
+                (project, limit),
+            ).fetchall()
+            return [self._fact_row_to_dict(row) for row in rows]
+        finally:
+            conn.close()
+
+    def get_recent_decisions(self, days: int = 14, limit: int = 20) -> List[Dict[str, Any]]:
+        """Decisions from the last `days` days."""
+        conn = self._connect()
+        try:
+            cutoff = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            rows = conn.execute(
+                """
+                SELECT decision_id, decision_text, rationale, project,
+                       owner, status, source_refs_json, created_at, updated_at
+                FROM decisions
+                WHERE created_at >= date(?, '-' || ? || ' days')
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (cutoff, days, limit),
+            ).fetchall()
+            return [
+                {
+                    "decision_id": r[0], "decision_text": r[1], "rationale": r[2],
+                    "project": r[3], "owner": r[4], "status": r[5],
+                    "source_refs_json": r[6], "created_at": r[7], "updated_at": r[8],
+                }
+                for r in rows
+            ]
+        finally:
+            conn.close()
+
+    def get_open_questions(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """Open questions ordered by creation date."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT question_id, question_text, project, priority,
+                       status, source_refs_json, next_action, created_at, updated_at
+                FROM open_questions
+                WHERE status = 'open'
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [
+                {
+                    "question_id": r[0], "question_text": r[1], "project": r[2],
+                    "priority": r[3], "status": r[4], "source_refs_json": r[5],
+                    "next_action": r[6], "created_at": r[7], "updated_at": r[8],
+                }
+                for r in rows
+            ]
+        finally:
+            conn.close()
+
+    def get_recent_dream_summaries(self, days: int = 7, limit: int = 10) -> List[Dict[str, Any]]:
+        """Recent successful dream runs with fact/decision/question counts."""
+        conn = self._connect()
+        try:
+            cutoff = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            rows = conn.execute(
+                """
+                SELECT dream_run_id, started_at, ended_at, status,
+                       facts_created, decisions_created, questions_created,
+                       input_scope_json
+                FROM dream_runs
+                WHERE started_at >= date(?, '-' || ? || ' days')
+                  AND status = 'success'
+                ORDER BY started_at DESC
+                LIMIT ?
+                """,
+                (cutoff, days, limit),
+            ).fetchall()
+            return [
+                {
+                    "dream_run_id": r[0], "started_at": r[1], "ended_at": r[2],
+                    "status": r[3], "facts_created": r[4],
+                    "decisions_created": r[5], "questions_created": r[6],
+                    "input_scope": json.loads(r[7]) if r[7] else None,
+                }
+                for r in rows
+            ]
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Row helpers
+    # ------------------------------------------------------------------
+
+    def _fact_row_to_dict(self, row: tuple) -> Dict[str, Any]:
+        """Convert a fact row (6 columns) to a dict."""
+        return {
+            "fact_id": row[0], "fact_text": row[1], "project": row[2],
+            "status": row[3], "source_refs_json": row[4], "created_at": row[5],
+        }

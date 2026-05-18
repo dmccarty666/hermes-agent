@@ -122,6 +122,7 @@ CREATE TABLE IF NOT EXISTS facts (
   project              TEXT,
   status               TEXT NOT NULL DEFAULT 'active',
   confidence           REAL,
+  hrr_vector           BLOB,
   source_refs_json     TEXT NOT NULL DEFAULT '[]',
   entity_ids_json      TEXT NOT NULL DEFAULT '[]',
   created_at           TEXT NOT NULL,
@@ -639,3 +640,172 @@ class MemoryDB:
             "fact_id": row[0], "fact_text": row[1], "project": row[2],
             "status": row[3], "source_refs_json": row[4], "created_at": row[5],
         }
+
+    # ------------------------------------------------------------------
+    # HRR-backed fact retrieval helpers (Epic 4.2.2)
+    # ------------------------------------------------------------------
+
+    def get_facts_with_hrr_vectors(
+        self,
+        category: Optional[str] = None,
+        limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        """Fetch active facts that have HRR vectors (for probe/related/reason).
+
+        Returns dicts with fact_id, fact_text, category, project, trust_score,
+        created_at, updated_at, and hrr_vector (bytes or None).
+        Falls back to keyword search when no HRR vectors exist.
+        """
+        conn = self._connect()
+        try:
+            where = "WHERE f.hrr_vector IS NOT NULL AND f.status = 'active'"
+            params: list = []
+            if category:
+                where += " AND f.scope = ?"
+                params.append(category)
+            params.extend([limit])
+            rows = conn.execute(
+                f"""
+                SELECT f.fact_id, f.fact_text, f.scope, f.project,
+                       f.confidence, f.hrr_vector, f.created_at, f.updated_at,
+                       f.entity_ids_json, f.source_refs_json
+                FROM facts f
+                {where}
+                ORDER BY f.confidence DESC, f.created_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+            return [
+                {
+                    "fact_id": r[0],
+                    "content": r[1],
+                    "category": r[2],
+                    "project": r[3],
+                    "trust_score": r[4] if r[4] is not None else 0.5,
+                    "hrr_vector": r[5],
+                    "created_at": r[6],
+                    "updated_at": r[7],
+                    "entity_ids": json.loads(r[8]) if r[8] else [],
+                    "source_refs": json.loads(r[9]) if r[9] else [],
+                }
+                for r in rows
+            ]
+        finally:
+            conn.close()
+
+    def get_all_active_facts(
+        self,
+        category: Optional[str] = None,
+        limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        """Fetch all active facts for FTS5 fallback (when no HRR vectors)."""
+        conn = self._connect()
+        try:
+            where = "WHERE f.status = 'active'"
+            params: list = []
+            if category:
+                where += " AND f.scope = ?"
+                params.append(category)
+            params.append(limit)
+            rows = conn.execute(
+                f"""
+                SELECT f.fact_id, f.fact_text, f.scope, f.project,
+                       f.confidence, f.created_at, f.updated_at,
+                       f.source_refs_json
+                FROM facts f
+                {where}
+                ORDER BY f.confidence DESC, f.created_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+            return [
+                {
+                    "fact_id": r[0],
+                    "content": r[1],
+                    "category": r[2],
+                    "project": r[3],
+                    "trust_score": r[4] if r[4] is not None else 0.5,
+                    "created_at": r[5],
+                    "updated_at": r[6],
+                    "source_refs": json.loads(r[7]) if r[7] else [],
+                }
+                for r in rows
+            ]
+        finally:
+            conn.close()
+
+    def fts5_search_facts(
+        self,
+        query: str,
+        category: Optional[str] = None,
+        min_trust: float = 0.3,
+        limit: int = 30,
+    ) -> List[Dict[str, Any]]:
+        """FTS5 search over facts table for fallback when HRR unavailable.
+
+        Returns facts ordered by confidence desc. Falls back to simple
+        non-FTS5 query when query is empty (FTS5 requires non-empty query).
+        """
+        conn = self._connect()
+        try:
+            if not query or not query.strip():
+                # No query — return recent facts ordered by confidence
+                where_clauses = ["f.status = 'active'", "f.confidence >= ?"]
+                params: list = [min_trust]
+                if category:
+                    where_clauses.append("f.scope = ?")
+                    params.append(category)
+                params.append(limit)
+                rows = conn.execute(
+                    f"""
+                    SELECT f.fact_id, f.fact_text, f.scope, f.project,
+                           f.confidence, f.created_at, f.updated_at,
+                           f.source_refs_json,
+                           0 AS rank
+                    FROM facts f
+                    WHERE {' AND '.join(where_clauses)}
+                    ORDER BY f.confidence DESC, f.created_at DESC
+                    LIMIT ?
+                    """,
+                    params,
+                ).fetchall()
+            else:
+                # FTS5 search
+                where_clauses = ["facts_fts MATCH ?", "f.status = 'active'", "f.confidence >= ?"]
+                params = [query, min_trust]
+                if category:
+                    where_clauses.append("f.scope = ?")
+                    params.append(category)
+                params.append(limit)
+                rows = conn.execute(
+                    f"""
+                    SELECT f.fact_id, f.fact_text, f.scope, f.project,
+                           f.confidence, f.created_at, f.updated_at,
+                           f.source_refs_json,
+                           rank
+                    FROM facts_fts fts
+                    JOIN facts f ON f.rowid = fts.rowid
+                    WHERE {' AND '.join(where_clauses)}
+                    ORDER BY rank
+                    LIMIT ?
+                    """,
+                    params,
+                ).fetchall()
+            return [
+                {
+                    "fact_id": r[0],
+                    "content": r[1],
+                    "category": r[2],
+                    "project": r[3],
+                    "trust_score": r[4] if r[4] is not None else 0.5,
+                    "created_at": r[5],
+                    "updated_at": r[6],
+                    "source_refs": json.loads(r[7]) if r[7] else [],
+                    "fts_rank": r[8],
+                }
+                for r in rows
+            ]
+        finally:
+            conn.close()

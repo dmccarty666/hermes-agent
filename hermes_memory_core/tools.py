@@ -34,7 +34,7 @@ MEMORY_QUERY_SCHEMA: Dict[str, Any] = {
             "query":   {"type": "string"},
             "mode":    {
                 "type": "string",
-                "enum": ["keyword", "sessions", "recent"],
+                "enum": ["keyword", "sessions", "recent", "probe", "related", "reason"],
                 "default": "keyword",
             },
             "project": {"type": "string"},
@@ -220,6 +220,49 @@ def _handle_memory_query(args: Dict[str, Any], **kwargs) -> Dict[str, Any]:
         }
 
     # Unimplemented modes
+    if mode in ("probe", "related", "reason"):
+        from hermes_memory_core.search.hrri import FactRetriever
+
+        entity_arg = args.get("entity", args.get("query", ""))
+        entities_arg = args.get("entities", [])
+
+        if mode in ("probe", "related") and not entity_arg:
+            return {
+                "results": [],
+                "query": entity_arg,
+                "mode": mode,
+                "backend_hints": ["hrr"],
+                "error": f"mode '{mode}' requires 'entity' parameter",
+            }
+
+        db = _get_memory_db(kwargs)
+        retriever = FactRetriever(db)
+
+        if mode == "probe":
+            raw_results = retriever.probe(entity=entity_arg, category=filters.get("category"), limit=limit)
+        elif mode == "related":
+            raw_results = retriever.related(entity=entity_arg, category=filters.get("category"), limit=limit)
+        else:  # reason
+            entities_list = entities_arg if entities_arg else entity_arg.split() if entity_arg else []
+            raw_results = retriever.reason(entities=entities_list, category=filters.get("category"), limit=limit)
+
+        results = [
+            {
+                "content": r.get("content", ""),
+                "source_ref": f"fact:{r.get('fact_id', '')}",
+                "excerpt": (r.get("content", "") or "")[:200],
+                "score": r.get("score", 0.0),
+                "mode": mode,
+            }
+            for r in raw_results
+        ]
+        return {
+            "results": results,
+            "query": entity_arg or " ".join(entities_arg),
+            "mode": mode,
+            "backend_hints": ["hrr"],
+        }
+
     raise NotImplementedError(f"mode '{mode}' not yet implemented")
 
 
@@ -267,6 +310,16 @@ MEMORY_RECENT_CONTEXT_SCHEMA: Dict[str, Any] = {
         },
     },
 }
+
+
+def _get_memory_db(kwargs: Any) -> "MemoryDB":
+    """Return a MemoryDB instance, using test override if provided."""
+    from hermes_memory_core.store.sqlite import MemoryDB as MDB
+    if kwargs.get("memory_db") is not None:
+        return kwargs["memory_db"]
+    db = MDB()
+    db.initialize()
+    return db
 
 
 def _handle_memory_recent_context(

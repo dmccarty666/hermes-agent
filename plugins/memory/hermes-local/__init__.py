@@ -74,6 +74,9 @@ class HermesLocalProvider(MemoryProvider):
         self._session_id: str | None = None
         self._sync_seq: int = 0
 
+        # Indexer: lazily started on first capture so DB path is ready
+        self._indexer = None
+
     @property
     def name(self) -> str:
         return "hermes-local"
@@ -122,6 +125,20 @@ class HermesLocalProvider(MemoryProvider):
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Phase 1: prefetch not yet active."""
         pass
+
+    def _get_indexer(self):
+        """Lazily create and start the IndexerWorker singleton."""
+        if self._indexer is not None:
+            return self._indexer
+        try:
+            from hermes_memory_core.store.sqlite import MemoryDB
+            from hermes_memory_core.indexer import start_worker
+            db = MemoryDB()  # uses default path ~/.hermes/memory/index/memory.sqlite
+            self._indexer = start_worker(memory_db=db)
+            logger.info("IndexerWorker started by HermesLocalProvider")
+        except Exception as exc:
+            logger.error("Failed to start IndexerWorker: %s", exc)
+        return self._indexer
 
     def sync_turn(
         self,
@@ -200,6 +217,9 @@ class HermesLocalProvider(MemoryProvider):
 
             capture_event(user_event)
             capture_event(assistant_event)
+
+            # Kick the indexer (lazy-start on first capture)
+            self._get_indexer()
 
         except Exception as exc:
             logger.error(

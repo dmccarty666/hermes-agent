@@ -43,8 +43,10 @@ def test_get_tool_schemas_returns_memory_query_only(tmp_path: Path, monkeypatch)
     provider = HermesLocalProvider()
     schemas = provider.get_tool_schemas()
 
-    assert len(schemas) == 1, f"Expected exactly 1 schema, got {len(schemas)}: {schemas}"
-    assert schemas[0]["name"] == "memory_query"
+    assert len(schemas) == 2, f"Expected 2 schemas (memory_query + memory_get_source), got {len(schemas)}: {schemas}"
+    names = {s["name"] for s in schemas}
+    assert "memory_query" in names, f"memory_query schema missing, got: {names}"
+    assert "memory_get_source" in names, f"memory_get_source schema missing, got: {names}"
 
 
 def test_memory_query_schema_has_modes_keyword_sessions_recent(tmp_path: Path, monkeypatch) -> None:

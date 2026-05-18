@@ -129,8 +129,13 @@ def test_hermes_local_provider_class_exists() -> None:
 # Test: get_tool_schemas returns [] (Phase 1 — no tools yet)
 # ---------------------------------------------------------------------------
 
-def test_get_tool_schemas_returns_empty_list() -> None:
-    """Phase 1: get_tool_schemas() must return []."""
+def test_get_tool_schemas_returns_memory_query_schema(tmp_path: Path, monkeypatch) -> None:
+    """Phase 2: get_tool_schemas() must return the memory_query schema."""
+    fake_home = tmp_path / "hermes_home"
+    fake_home.mkdir()
+    (fake_home / "config.yaml").write_text("memory:\n  provider: hermes-local\n")
+    monkeypatch.setenv("HERMES_HOME", str(fake_home))
+
     spec = importlib.util.spec_from_file_location(
         "hermes_local_plugin",
         str(plugin_dir() / "__init__.py"),
@@ -140,7 +145,9 @@ def test_get_tool_schemas_returns_empty_list() -> None:
 
     provider = module.HermesLocalProvider()
     schemas = provider.get_tool_schemas()
-    assert schemas == [], f"Phase 1 tool schemas must be []; got {schemas}"
+    assert len(schemas) == 1, f"Expected 1 schema for Phase 2, got {len(schemas)}: {schemas}"
+    assert schemas[0]["name"] == "memory_query", \
+        f"Schema name must be 'memory_query', got: {schemas[0].get('name')}"
 
 
 # ---------------------------------------------------------------------------

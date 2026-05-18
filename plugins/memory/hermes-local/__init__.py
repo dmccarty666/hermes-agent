@@ -211,12 +211,14 @@ class HermesLocalProvider(MemoryProvider):
             raise
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        """Phase 1: zero tools registered — tools land in Phase 2."""
-        return []
+        """Phase 2: delegate to hermes_memory_core/tools.py."""
+        from hermes_memory_core.tools import get_tool_schemas as _get_schemas
+        return _get_schemas()
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
-        """Phase 1: no tools to handle."""
-        raise NotImplementedError(f"HermesLocalProvider does not handle tool {tool_name}")
+        """Phase 2: delegate to hermes_memory_core/tools.py."""
+        from hermes_memory_core.tools import handle_tool_call as _dispatch
+        return _dispatch(tool_name, args, **kwargs)
 
     def shutdown(self) -> None:
         """Phase 1: nothing to shut down."""

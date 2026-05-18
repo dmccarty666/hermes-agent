@@ -45,7 +45,7 @@ FAKE = {
     "aws_access_key": "AKIAFAKEFAKEFAKEFAKE",
     "aws_secret": "fakeawssecretkey1234567890abcdefghijklmnop",  # 44 chars for high_entropy
     "github_token_ghp": "ghp_fakeFakeFakeFakeFakeFakeFakeFakeFake",
-    "github_token_gho": "gho_fakeFakeFakeFakeFakeFakeFakeFakeFakeFake",
+    "github_token_gho": "gho_fakeFakeFakeFakeFakeFakeFakeFakeFAKE",
     "github_pat": "github_pat_fakeFakeFakeFakeFakeFake_FakeFake",
     "private_key_rsa": (
         "-----BEGIN RSA PRIVATE KEY-----\n"
@@ -281,8 +281,9 @@ class TestNoDoubleWrapping:
         secret = FAKE["openai_key"]
         content = f"secret={secret} and already masked: [REDACTED:openai_key]"
         result = scan(content)
-        # Only the real secret should be redacted, not the literal placeholder
-        assert result.redacted_content.count("[REDACTED:openai_key]") == 1
+        # Only the real secret should be caught as a hit (not the literal placeholder)
+        assert len(result.hits) == 1, f"Expected 1 hit (real secret), got {len(result.hits)}: {result.hits}"
+        assert result.redacted_content.count("[REDACTED:openai_key]") >= 1
         assert secret not in result.redacted_content
 
 

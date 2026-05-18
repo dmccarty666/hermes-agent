@@ -29,18 +29,17 @@ _PATTERNS: List[tuple[str, re.Pattern]] = [
         "aws_access_key",
         re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     ),
+    # Anthropic key: sk-ant- followed by 20+ chars (before openai_key)
+    (
+        "anthropic_key",
+        re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b"),
+    ),
     # OpenAI key: sk- followed by 20+ alphanumeric/hyphen/underscore
     (
         "openai_key",
         re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
     ),
-    # Anthropic key: sk-ant- followed by 20+ chars
-    (
-        "anthropic_key",
-        re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b"),
-    ),
-    # GitHub token: ghp_ / gho_ / ghs_ / ghu_ / ghr_ or github_pat_ followed by
-    # sufficient chars. Bounded by non-alphanumeric on both sides.
+    # GitHub token: ghp_/gho_/ghs_/ghu_/ghr_/github_pat_ + sufficient chars
     (
         "github_token",
         re.compile(
@@ -83,15 +82,13 @@ def _luhn_is_valid(number: str) -> bool:
     if not stripped.isdigit() or not (13 <= len(stripped) <= 19):
         return False
     digits = [int(d) for d in stripped]
-    # Luhn: double every second digit from the right, sum digits of products
-    # plus the undoubled digits. Total must be divisible by 10.
     total = 0
-    for i, d in enumerate(reversed(digits)):
-        if i % 2 == 1:  # every second digit from right (index 1,3,5,...)
-            d = d * 2
-            if d > 9:
-                d -= 9
-        total += d
+    for i, digit in enumerate(reversed(digits)):
+        if i % 2 == 1:
+            digit = digit * 2
+            if digit > 9:
+                digit -= 9
+        total += digit
     return total % 10 == 0
 
 
@@ -129,83 +126,68 @@ class Redactor:
         Returns ``RedactionResult`` with redacted content, list of hits (type only),
         and ``fired`` bool.
 
-        No double-wrapping: already-replaced spans are tracked and skipped.
+        Algorithm: collect all matches across all patterns (in original positions),
+        sort by position, filter overlapping spans, then apply replacements
+        in one pass. This avoids offset-drift bugs from sequential string rebuilding.
         """
         if not content:
             return RedactionResult(redacted_content="", hits=[], fired=False)
 
-        hits: List[RedactionHit] = []
-        replaced: List[tuple[int, int]] = []   # [(start, end), ...] merged
+        # --- Pass 1: collect all specific-pattern hits (in original positions) ---
+        raw_hits: List[tuple[int, int, str]] = []  # [(start, end, name), ...]
 
-        def mark(start: int, end: int) -> None:
-            replaced.append((start, end))
-
-        def is_overlapping(start: int, end: int) -> bool:
-            return any(s < end and e > start for s, e in replaced)
-
-        result = content
-
-        # --- Pass 1: specific patterns ---
         for name, pattern in _PATTERNS:
-            parts: List[str] = []
-            last_pos = 0
-
-            for m in pattern.finditer(result):
-                s, e = m.start(), m.end()
-                if is_overlapping(s, e):
-                    continue
-                parts.append(result[last_pos:s])
-                parts.append(f"[REDACTED:{name}]")
-                mark(s, e)
-                last_pos = e
-                hits.append(RedactionHit(pattern_name=name, start=s, end=e))
-
-            if parts:
-                parts.append(result[last_pos:])
-                result = "".join(parts)
+            for m in pattern.finditer(content):
+                raw_hits.append((m.start(), m.end(), name))
 
         # --- Pass 2: Luhn-validated card numbers ---
-        parts = []
-        last_pos = 0
+        for m in _LUHN_DIGITS.finditer(content):
+            if _luhn_is_valid(m.group(0)):
+                raw_hits.append((m.start(), m.end(), "card"))
 
-        for m in _LUHN_DIGITS.finditer(result):
+        # Sort by start position (ascending) — same start, longer first
+        raw_hits.sort(key=lambda x: (x[0], -(x[1] - x[0])))
+
+        # Filter overlapping spans: keep the first match that starts,
+        # skip any that overlap with an already-kept span
+        kept: List[tuple[int, int, str]] = []
+        for hit in raw_hits:
+            s, e, name = hit
+            if not any(s < oe and e > os for os, oe, _ in kept):
+                kept.append(hit)
+
+        # Sort kept hits by start for reconstruction
+        kept.sort(key=lambda x: x[0])
+
+        # --- Pass 3: high-entropy strings (secondary) ---
+        # Run after keeping the above hits so we skip anything already matched
+        he_hits: List[tuple[int, int, str]] = []
+        for m in _HE_PATTERN.finditer(content):
             s, e = m.start(), m.end()
-            if is_overlapping(s, e):
-                continue
-            number = m.group(0)
-            if _luhn_is_valid(number):
-                parts.append(result[last_pos:s])
-                parts.append("[REDACTED:card]")
-                mark(s, e)
-                last_pos = e
-                hits.append(RedactionHit(pattern_name="card", start=s, end=e))
+            if not any(s < oe and e > os for (os, oe, _) in kept + he_hits):
+                he_hits.append((s, e, "high_entropy"))
 
-        if parts:
-            parts.append(result[last_pos:])
-            result = "".join(parts)
+        all_hits = kept + he_hits
+        all_hits.sort(key=lambda x: x[0])
 
-        # --- Pass 3: high-entropy strings (secondary — catches long base64/hex) ---
-        parts = []
-        last_pos = 0
+        # --- Build redacted content by splicing ---
+        hits_out: List[RedactionHit] = []
+        result_parts: List[str] = []
+        cursor = 0
 
-        for m in _HE_PATTERN.finditer(result):
-            s, e = m.start(), m.end()
-            if is_overlapping(s, e):
-                continue
-            parts.append(result[last_pos:s])
-            parts.append("[REDACTED:high_entropy]")
-            mark(s, e)
-            last_pos = e
-            hits.append(RedactionHit(pattern_name="high_entropy", start=s, end=e))
+        for s, e, name in all_hits:
+            result_parts.append(content[cursor:s])
+            result_parts.append(f"[REDACTED:{name}]")
+            cursor = e
+            hits_out.append(RedactionHit(pattern_name=name, start=s, end=e))
 
-        if parts:
-            parts.append(result[last_pos:])
-            result = "".join(parts)
+        result_parts.append(content[cursor:])
+        redacted_content = "".join(result_parts)
 
-        if hits:
-            logger.info("Redaction fired: %d secret(s) detected", len(hits))
+        if hits_out:
+            logger.info("Redaction fired: %d secret(s) detected", len(hits_out))
 
-        return RedactionResult(redacted_content=result, hits=hits, fired=bool(hits))
+        return RedactionResult(redacted_content=redacted_content, hits=hits_out, fired=bool(hits_out))
 
 
 # Module-level default instance (pipeline imports this)

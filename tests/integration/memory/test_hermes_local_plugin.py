@@ -208,7 +208,6 @@ CORE_DIRS = [
     "store",
     "search",
     "write",
-    "chunk",
     "embed",
     "dream",
     "source",

@@ -12,6 +12,8 @@ Config namespace: ``plugins.hermes-local-memory`` in ``~/.hermes/config.yaml``.
 from __future__ import annotations
 
 import logging
+import hashlib
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -70,6 +72,7 @@ class HermesLocalProvider(MemoryProvider):
     def __init__(self, config: dict | None = None):
         self._config = config or _load_plugin_config()
         self._session_id: str | None = None
+        self._sync_seq: int = 0
 
     @property
     def name(self) -> str:
@@ -120,10 +123,92 @@ class HermesLocalProvider(MemoryProvider):
         """Phase 1: prefetch not yet active."""
         pass
 
-    def sync_turn(self, user_content: str, assistant_content: str,
-                 *, session_id: str = "") -> None:
-        """Phase 1: capture not yet wired. Stub for compilation."""
-        pass
+    def sync_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        session_id: str = "",
+    ) -> None:
+        """Capture a turn: redact → JSONL → SQLite sessions/turns/raw_events → audit.
+
+        Args:
+            user_content: Raw user message content.
+            assistant_content: Raw assistant response content.
+            session_id: The Hermes session identifier.
+
+        Raises:
+            RuntimeError: if capture fails after all retries (SQLite locked path).
+        """
+        if not session_id:
+            logger.warning("sync_turn called with empty session_id — skipping")
+            return
+
+        from hermes_memory_core.write.pipeline import capture_event
+        from datetime import datetime, timezone
+
+        try:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            seq = self._sync_seq
+            self._sync_seq += 1
+
+            # Build the user turn event — all EventSchema required fields must be present
+            user_event = {
+                "event_id": f"evt_{uuid.uuid4().hex[:12]}",
+                "session_id": session_id,
+                "turn_id": f"turn_{uuid.uuid4().hex[:12]}",
+                "timestamp": now_iso,
+                "role": "user",
+                "content": user_content,
+                "agent": "hermes-local",
+                "project": "default",
+                "source": "cli",
+                "tags": [],
+                "attachments": [],
+                "metadata": {},
+                "sequence": seq,
+                "content_hash": hashlib.sha256(
+                    (session_id + str(seq) + now_iso + "user" + user_content + "hermes-local").encode()
+                ).hexdigest(),
+                "dream_status": "pending",
+                "embedding_status": "pending",
+                "index_status": "pending",
+            }
+
+            # Build the assistant turn event (same turn_id to group them)
+            assistant_event = {
+                "event_id": f"evt_{uuid.uuid4().hex[:12]}",
+                "session_id": session_id,
+                "turn_id": user_event["turn_id"],
+                "timestamp": now_iso,
+                "role": "assistant",
+                "content": assistant_content,
+                "agent": "hermes-local",
+                "project": "default",
+                "source": "cli",
+                "tags": [],
+                "attachments": [],
+                "metadata": {},
+                "sequence": seq,
+                "content_hash": hashlib.sha256(
+                    (session_id + str(seq) + now_iso + "assistant" + assistant_content + "hermes-local").encode()
+                ).hexdigest(),
+                "dream_status": "pending",
+                "embedding_status": "pending",
+                "index_status": "pending",
+            }
+
+            capture_event(user_event)
+            capture_event(assistant_event)
+
+        except Exception as exc:
+            logger.error(
+                "sync_turn capture failed for session_id=%s: %s",
+                session_id,
+                exc,
+                exc_info=True,
+            )
+            raise
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         """Phase 1: zero tools registered — tools land in Phase 2."""

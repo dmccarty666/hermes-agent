@@ -70,6 +70,8 @@ def capture_event(
     event: Dict[str, Any],
     *,
     skip_redaction: bool = False,
+    db: Optional["MemoryDB"] = None,
+    fs: Optional["FSStore"] = None,
 ) -> Dict[str, Any]:
     """Canonical write path: redact, append JSONL, insert SQLite, audit.
 
@@ -79,6 +81,10 @@ def capture_event(
             May also contain tool_calls (list) for tool-result scanning.
         skip_redaction: If True, skip the redaction scan. Used only for
             testing or special internal cases.
+        db: Optional MemoryDB instance. If omitted, uses the process-global
+            singleton (useful for normal runtime; tests should pass this
+            parameter explicitly to avoid singleton issues with pytest-xdist).
+        fs: Optional FSStore instance. Same reasoning as ``db``.
 
     Returns:
         dict with keys: event_id, content_hash, session_id, redaction_fired,
@@ -172,16 +178,19 @@ def capture_event(
                     att["_redacted_name"] = fname_result.redacted_content
                     att["name"] = fname_result.redacted_content
 
-    # ---- Step 2: JSONL append ---------------------------------------------/
-    db = _get_memory_db()
-    fs = _get_fs_store()
+    # Redact content in-place so JSONL write sees the redacted version
+        event["content"] = redacted_content
 
-    content_hash = fs.append_event(event)
+    # ---- Step 2: JSONL append ---------------------------------------------/
+    _db = db if db is not None else _get_memory_db()
+    _fs = fs if fs is not None else _get_fs_store()
+
+    content_hash = _fs.append_event(event)
 
     # ---- Step 3: SQLite session upsert -----------------------------------/
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    conn = db._connect()
+    conn = _db._connect()
     try:
         conn.execute(
             """INSERT INTO sessions
@@ -191,11 +200,12 @@ def capture_event(
             """,
             (session_id, agent, None, None, timestamp, None, source, None),
         )
+        conn.commit()
     finally:
         conn.close()
 
     # ---- Step 4: SQLite turns insert (idempotent by turn_id) -------------/
-    conn = db._connect()
+    conn = _db._connect()
     try:
         # Check if already exists (idempotency)
         existing = conn.execute(
@@ -226,11 +236,12 @@ def capture_event(
                     json.dumps(redaction_types) if redaction_fired else None,
                 ),
             )
+        conn.commit()
     finally:
         conn.close()
 
     # ---- Step 5: SQLite raw_events insert --------------------------------/
-    conn = db._connect()
+    conn = _db._connect()
     try:
         # Build the full event JSON for raw_events (with redacted content)
         # We store the redacted version in raw_events too
@@ -239,11 +250,18 @@ def capture_event(
         # tool_calls redacted in-place
         if tool_calls:
             event_for_raw["tool_calls"] = tool_calls
+        # attachments redacted in-place — copy to event_for_raw
+        # Use _redacted_name if available (pipeline set it), else name, else filename
+        if event.get("attachments"):
+            event_for_raw["attachments"] = [
+                {**att, "filename": att.get("_redacted_name") or att.get("name") or att.get("filename")}
+                for att in event["attachments"]
+            ]
         raw_json = json.dumps(event_for_raw, ensure_ascii=False)
 
         # Get byte offset (approximate — length of current JSONL file)
-        raw_dir = fs.base_path / "raw"
-        jsonl_path = fs._jsonl_path(session_id)
+        raw_dir = _fs.base_path / "raw"
+        jsonl_path = _fs._jsonl_path(session_id)
         byte_offset = 0
         if jsonl_path.exists():
             byte_offset = jsonl_path.stat().st_size
@@ -269,6 +287,7 @@ def capture_event(
                 raw_json,
             ),
         )
+        conn.commit()
     finally:
         conn.close()
 
@@ -283,7 +302,7 @@ def capture_event(
             "tool_names": _redacted_tool_names or None,
             "source_type": "tool_result" if _redacted_tool_names else "message",
         }
-        conn = db._connect()
+        conn = _db._connect()
         try:
             conn.execute(
                 """INSERT INTO audit_log
@@ -299,6 +318,7 @@ def capture_event(
                     json.dumps(audit_detail),
                 ),
             )
+            conn.commit()
         finally:
             conn.close()
         audit_logged = True

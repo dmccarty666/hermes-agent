@@ -216,8 +216,8 @@ def test_memory_query_keyword_with_project_filter(tmp_path: Path, monkeypatch) -
 # Test: unimplemented modes raise NotImplementedError
 # ------------------------------------------------------------------
 
-def test_memory_query_semantic_raises_not_implemented(tmp_path: Path, monkeypatch) -> None:
-    """AC-4: memory_query(mode='semantic') raises NotImplementedError."""
+def test_memory_query_semantic_calls_semantic_search_and_returns_results(tmp_path: Path, monkeypatch) -> None:
+    """AC-4: memory_query(mode='semantic') calls semantic_search and returns normalized results."""
     fake_home = tmp_path / "hermes_home"
     fake_home.mkdir()
     (fake_home / "config.yaml").write_text("memory:\n  provider: hermes-local\n")
@@ -226,12 +226,34 @@ def test_memory_query_semantic_raises_not_implemented(tmp_path: Path, monkeypatc
     HermesLocalProvider = load_provider()
     provider = HermesLocalProvider()
 
-    with pytest.raises(NotImplementedError) as exc_info:
-        provider.handle_tool_call(
+    # Mock semantic_search to avoid needing real LMS/Qdrant
+    fake_results = [
+        {
+            "content": "test chunk text",
+            "source_ref": "session:sess_001#chunk=chunk_abc",
+            "score": 0.95,
+            "metadata": {"chunk_id": "chunk_abc", "session_id": "sess_001"},
+        }
+    ]
+    from unittest.mock import patch
+    with patch("hermes_memory_core.tools.semantic_search", return_value=fake_results) as mock_ss:
+        result_str = provider.handle_tool_call(
             "memory_query",
-            {"query": "test", "mode": "semantic"},
+            {"query": "test semantic query", "mode": "semantic", "limit": 5},
         )
-    assert "semantic mode not yet implemented" in str(exc_info.value)
+        result = json.loads(result_str)
+
+        mock_ss.assert_called_once()
+        call_kwargs = mock_ss.call_args.kwargs
+        assert call_kwargs["query"] == "test semantic query"
+        assert call_kwargs["limit"] == 5
+
+        assert len(result["results"]) == 1
+        assert result["results"][0]["content"] == "test chunk text"
+        assert result["mode"] == "semantic"
+        assert result["backend_hints"] == ["qdrant"]
+
+    # semantic mode no longer raises NotImplementedError — T-019 implemented
 
 
 def test_memory_query_hybrid_raises_not_implemented(tmp_path: Path, monkeypatch) -> None:

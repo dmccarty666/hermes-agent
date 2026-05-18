@@ -2,7 +2,7 @@
 """Tool schemas and dispatch for hermes-memory.
 
 Exposes memory_query (keyword/sessions/recent modes) per TDD §5.2.
-All other modes raise NotImplementedError.
+memory_get_source (resolve source refs) per TDD §5.2.
 """
 
 from __future__ import annotations
@@ -12,6 +12,8 @@ import logging
 from typing import Any, Dict, List
 
 from hermes_memory_core.search.fts5 import fts5_search
+from hermes_memory_core.search.semantic import semantic_search
+from hermes_memory_core.source import resolve
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,23 @@ MEMORY_QUERY_SCHEMA: Dict[str, Any] = {
     },
 }
 
+MEMORY_GET_SOURCE_SCHEMA: Dict[str, Any] = {
+    "name": "memory_get_source",
+    "description": (
+        "Resolve a source_ref back to original content. "
+        "Handles session turns, facts, decisions, and chunks. "
+        "Returns {kind:'missing',...} for archived/missing refs — no error raised."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "source_ref": {"type": "string", "description": "Ref to resolve: session:{id}#turn={n}, fact:{id}, decision:{id}, chunk:{id}"},
+            "expand":     {"type": "boolean", "default": False, "description": "Also resolve nested source_refs found in tool_call provenance chains"},
+        },
+        "required": ["source_ref"],
+    },
+}
+
 
 # ------------------------------------------------------------------
 # get_tool_schemas
@@ -52,7 +71,7 @@ MEMORY_QUERY_SCHEMA: Dict[str, Any] = {
 
 def get_tool_schemas() -> List[Dict[str, Any]]:
     """Return the list of tool schemas for Phase 2."""
-    return [MEMORY_QUERY_SCHEMA]
+    return [MEMORY_QUERY_SCHEMA, MEMORY_GET_SOURCE_SCHEMA]
 
 
 # ------------------------------------------------------------------
@@ -63,6 +82,8 @@ def handle_tool_call(tool_name: str, args: Dict[str, Any], **kwargs) -> str:
     """Dispatch a tool call to its handler; return a JSON string result."""
     if tool_name == "memory_query":
         return json.dumps(_handle_memory_query(args, **kwargs))
+    if tool_name == "memory_get_source":
+        return json.dumps(_handle_memory_get_source(args, **kwargs))
     return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
 
@@ -164,8 +185,40 @@ def _handle_memory_query(args: Dict[str, Any], **kwargs) -> Dict[str, Any]:
             "backend_hints": ["fts5"],
         }
 
+    if mode == "semantic":
+        try:
+            raw_results = semantic_search(
+                query=query,
+                filters=filters,
+                limit=limit,
+            )
+        except Exception as exc:
+            return {
+                "results": [],
+                "query": query,
+                "mode": mode,
+                "backend_hints": ["qdrant"],
+                "error": str(exc),
+            }
+        results = [
+            {
+                "content": r.get("content", ""),
+                "source_ref": r.get("source_ref", ""),
+                "excerpt": r.get("content", "")[:200],
+                "score": r.get("score", 0.0),
+                "mode": "semantic",
+            }
+            for r in raw_results
+        ]
+        return {
+            "results": results,
+            "query": query,
+            "mode": mode,
+            "backend_hints": ["qdrant"],
+        }
+
     # Unimplemented modes
-    raise NotImplementedError(f"semantic mode not yet implemented")
+    raise NotImplementedError(f"mode '{mode}' not yet implemented")
 
 
 def _safe_content(r: Dict[str, Any]) -> str:
@@ -174,3 +227,20 @@ def _safe_content(r: Dict[str, Any]) -> str:
         if key in r and r[key]:
             return r[key]
     return r.get("snippet", "")
+
+
+def _handle_memory_get_source(args: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+    """Handle memory_get_source tool call.
+
+    Args:
+        args: The tool arguments (source_ref, expand).
+        **kwargs: May contain memory_db for test isolation.
+
+    Returns:
+        A result dict with kind field: session:turn, fact, decision, chunk,
+        or {kind:'missing', source_ref, reason}.
+    """
+    source_ref = args.get("source_ref", "")
+    expand = bool(args.get("expand", False))
+    memory_db = kwargs.get("memory_db")
+    return resolve(source_ref, memory_db=memory_db, expand=expand)

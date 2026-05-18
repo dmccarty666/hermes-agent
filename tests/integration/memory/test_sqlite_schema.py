@@ -262,7 +262,7 @@ class TestFTS5Triggers:
         with sqlite3.connect(fresh_db) as conn:
             cur = conn.execute(
                 "SELECT name FROM sqlite_master "
-                "WHERE type='trigger' AND name LIKE 'chunks_a%'"
+                "WHERE type='trigger' AND name LIKE 'chunks_fts_%'"
             )
             names = {row[0] for row in cur}
         assert len(names) >= 2, f"Expected insert+update triggers for chunks_fts, got {names}"
@@ -274,7 +274,7 @@ class TestFTS5Triggers:
         with sqlite3.connect(fresh_db) as conn:
             cur = conn.execute(
                 "SELECT name FROM sqlite_master "
-                "WHERE type='trigger' AND name LIKE 'decisions_a%'"
+                "WHERE type='trigger' AND name LIKE 'decisions_fts_%'"
             )
             names = {row[0] for row in cur}
         assert len(names) >= 2, f"Expected insert+update triggers for decisions_fts, got {names}"

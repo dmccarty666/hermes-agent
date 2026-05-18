@@ -168,7 +168,7 @@ def run_slash(rest: str) -> str:
         return f"✓ ~/.hermes/memory/ initialized.\n  Created: {', '.join(sorted(created))}"
 
     # Delegate all other subcommands to the hermes-local plugin CLI
-    if sub in ("health", "db", "capture-test", "ls-sessions"):
+    if sub in ("health", "db", "qdrant-init", "capture-test", "ls-sessions"):
         try:
             # Use direct file import (bypasses namespace issues with hyphenated dirs)
             import importlib.util

@@ -56,6 +56,8 @@ def run_memory_subcommand(subcommand: str, rest: str = "") -> str:
         return _health()
     if subcommand == "db":
         return _db(rest)
+    if subcommand == "qdrant-init":
+        return _qdrant_init()
     if subcommand == "capture-test":
         return _capture_test()
     if subcommand == "ls-sessions":
@@ -204,6 +206,27 @@ def _db_init() -> str:
         import traceback
 
         return f"DB init failed: {e}\n{traceback.format_exc()}"
+
+
+def _qdrant_init() -> str:
+    """Initialize (or verify) the Qdrant collections."""
+    try:
+        from hermes_memory_core.store.qdrant import init_collections, QdrantInitError
+
+        result = init_collections()
+        if result["status"] == "already_initialized":
+            return "OK Qdrant collections already initialized (no-op).\n  Run `hermes memory health` to verify."
+        if result["status"] == "created":
+            collections = ", ".join(result["collections"])
+            return f"OK Qdrant collections created: {collections}\n  Run `hermes memory health` to verify."
+        if result["errors"]:
+            return f"Qdrant init had errors: {'; '.join(result['errors'])}"
+        return f"Qdrant init: {result['status']}"
+    except QdrantInitError as e:
+        return f"Qdrant init failed: {e}"
+    except Exception as e:
+        import traceback
+        return f"Qdrant init error: {e}\n{traceback.format_exc()}"
 
 
 # -----------------------------------------------------------------------
@@ -376,8 +399,9 @@ Hermes Local Memory — available commands:
 
   hermes memory health        Show plugin health and configuration
   hermes memory db init       Initialize SQLite schema
+  hermes memory qdrant-init   Initialize Qdrant collections (Phase 3)
   hermes memory capture-test  Inject a synthetic turn end-to-end
-  hermes memory ls-sessions    List captured sessions (from SQLite)
+  hermes memory ls-sessions   List captured sessions (from SQLite)
 
 Run `hermes memory init` first if you haven't initialized the directory tree.
 """

@@ -164,7 +164,7 @@ class TestSchemaInit:
             cur = conn.execute("PRAGMA table_info(turns)")
             cols = {row[1] for row in cur}
         assert "redaction_applied" in cols
-        assert "redaction_types_json" in cols
+        assert "redaction_count" in cols
 
     def test_raw_events_has_required_columns(self, fresh_db):
         db = MemoryDB(db_path=fresh_db)
@@ -240,7 +240,7 @@ class TestFTS5Triggers:
         with sqlite3.connect(fresh_db) as conn:
             cur = conn.execute(
                 "SELECT name FROM sqlite_master "
-                "WHERE type='trigger' AND name LIKE 'turns_fts%'"
+                "WHERE type='trigger' AND name LIKE 'turns_fts_%'"
             )
             names = {row[0] for row in cur}
         assert len(names) >= 2, f"Expected insert+update triggers for turns_fts, got {names}"
@@ -251,7 +251,7 @@ class TestFTS5Triggers:
         with sqlite3.connect(fresh_db) as conn:
             cur = conn.execute(
                 "SELECT name FROM sqlite_master "
-                "WHERE type='trigger' AND name LIKE 'facts_fts%'"
+                "WHERE type='trigger' AND name LIKE 'facts_fts_%'"
             )
             names = {row[0] for row in cur}
         assert len(names) >= 2, f"Expected insert+update triggers for facts_fts, got {names}"
@@ -262,7 +262,7 @@ class TestFTS5Triggers:
         with sqlite3.connect(fresh_db) as conn:
             cur = conn.execute(
                 "SELECT name FROM sqlite_master "
-                "WHERE type='trigger' AND name LIKE 'chunks_fts%'"
+                "WHERE type='trigger' AND name LIKE 'chunks_a%'"
             )
             names = {row[0] for row in cur}
         assert len(names) >= 2, f"Expected insert+update triggers for chunks_fts, got {names}"
@@ -274,7 +274,7 @@ class TestFTS5Triggers:
         with sqlite3.connect(fresh_db) as conn:
             cur = conn.execute(
                 "SELECT name FROM sqlite_master "
-                "WHERE type='trigger' AND name LIKE 'decisions_fts%'"
+                "WHERE type='trigger' AND name LIKE 'decisions_a%'"
             )
             names = {row[0] for row in cur}
         assert len(names) >= 2, f"Expected insert+update triggers for decisions_fts, got {names}"

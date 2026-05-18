@@ -2913,6 +2913,8 @@ class DispatchResult:
     available) from "correctly idle" (nothing spawnable in the queue)."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
+    auto_completed: list[str] = field(default_factory=list)
+    """Task ids auto-marked done because worker exited cleanly without calling kanban_complete."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
     timed_out: list[str] = field(default_factory=list)
@@ -3309,9 +3311,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     returning 0 without a terminal transition just loops forever.
     """
     crashed: list[str] = []
+    auto_completed: list[str] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
-    # write_txn so can't nest). ``protocol_violation`` flags the
+    # write txn so can't nest). ``protocol_violation`` flags the
     # clean-exit-but-still-running case so we can trip the breaker
     # immediately instead of incrementing by 1.
     crash_details: list[tuple[str, int, str, bool, str]] = []
@@ -3363,7 +3366,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_code"] = code
 
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = 'done', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running'",
                 (row["id"],),
@@ -3371,19 +3374,20 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             if cur.rowcount == 1:
                 run_id = _end_run(
                     conn, row["id"],
-                    outcome="crashed", status="crashed",
+                    outcome="completed", status="completed",
                     error=error_text,
                     metadata=dict(event_payload),
                 )
                 _append_event(
-                    conn, row["id"], event_kind,
-                    event_payload,
+                    conn, row["id"], "auto_completed",
+                    {"reason": "clean_exit_no_protocol_call", "pid": pid},
                     run_id=run_id,
                 )
+                auto_completed.append(row["id"])
                 crashed.append(row["id"])
                 crash_details.append(
                     (row["id"], pid, row["claim_lock"],
-                     protocol_violation, error_text)
+                     True, error_text)
                 )
     # Outside the main txn: increment the unified failure counter for
     # each crashed task. If the breaker trips, the task transitions
@@ -3413,6 +3417,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # and tests that destructure the result; ``dispatch_once`` reads this
     # side-channel attribute to populate ``DispatchResult.auto_blocked``.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
+    detect_crashed_workers._last_auto_completed = auto_completed  # type: ignore[attr-defined]
     return crashed
 
 
@@ -3744,6 +3749,11 @@ def dispatch_once(
     )
     if _crash_auto_blocked:
         result.auto_blocked.extend(_crash_auto_blocked)
+    _crash_auto_completed = getattr(
+        detect_crashed_workers, "_last_auto_completed", []
+    )
+    if _crash_auto_completed:
+        result.auto_completed.extend(_crash_auto_completed)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn)
 
@@ -3923,6 +3933,23 @@ def _default_spawn(
     import subprocess
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
+
+    # Validate task skills before spawning — fail fast with a clear error
+    # instead of letting the worker spawn, crash with "Unknown skill", and
+    # consume a retry slot on the card.
+    if task.skills:
+        try:
+            from tools.skills_tool import _find_all_skills
+            valid = {s["name"] for s in _find_all_skills()}
+            bad = [s for s in task.skills
+                   if s and s != "kanban-worker" and s not in valid]
+            if bad:
+                raise ValueError(
+                    f"task {task.id} has unknown skill(s): {', '.join(bad)}"
+                    f"  Run `hermes skills list` to see available skills."
+                )
+        except ImportError:
+            pass  # Can't validate — let the worker try (original behaviour)
 
     from hermes_cli.profiles import normalize_profile_name
 

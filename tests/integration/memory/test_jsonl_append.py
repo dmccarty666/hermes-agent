@@ -158,14 +158,17 @@ class TestDateSegmentedFiles:
 
 class TestDedupByContentHash:
     def test_duplicate_content_is_skipped(self, store, tmp_base):
-        """AC-3: event with same content_hash is not written twice."""
+        """AC-3: event with same content_hash returns False on second call."""
         event = make_event(session_id="sess_dup", turn_id="turn_dup", sequence=0,
                             content="duplicate me")
 
         h1 = store.append_event(event)
         h2 = store.append_event(event)  # same event, same hash
 
-        assert h1 == h2  # same hash returned
+        # First call returns a content hash (truthy)
+        assert isinstance(h1, str) and len(h1) == 64
+        # Second call returns False (dedup hit)
+        assert h2 is False
 
         # File should have only ONE line
         date_dir = tmp_base / "raw" / "2026" / "2026-05-17"

@@ -167,7 +167,47 @@ def run_slash(rest: str) -> str:
 
         return f"✓ ~/.hermes/memory/ initialized.\n  Created: {', '.join(sorted(created))}"
 
-    return "Usage: /memory init\n\nInitializes the ~/.hermes/memory/ directory tree."
+    # Delegate all other subcommands to the hermes-local plugin CLI
+    if sub in ("health", "db", "capture-test", "ls-sessions"):
+        try:
+            # Use direct file import (bypasses namespace issues with hyphenated dirs)
+            import importlib.util
+            import sys
+            cli_path = Path(__file__).resolve().parent.parent / "plugins" / "memory" / "hermes-local" / "cli.py"
+            module_name = "hermes_local_memory_cli"
+            spec = importlib.util.spec_from_file_location(module_name, str(cli_path))
+            if spec and spec.loader:
+                cli_mod = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = cli_mod
+                spec.loader.exec_module(cli_mod)
+                return cli_mod.run_memory_subcommand(sub, " ".join(tokens[1:]))
+        except Exception as e:
+            return f"Error running 'memory {sub}': {e}\n(Hint: run 'hermes memory init' first.)"
+
+    # Unknown subcommand — show full help
+    try:
+        # Use direct file import (bypasses namespace issues with hyphenated dirs)
+        import importlib.util
+        import sys
+        cli_path = Path(__file__).resolve().parent.parent / "plugins" / "memory" / "hermes-local" / "cli.py"
+        module_name = "hermes_local_memory_cli"
+        spec = importlib.util.spec_from_file_location(module_name, str(cli_path))
+        if spec and spec.loader:
+            cli_mod = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = cli_mod
+            spec.loader.exec_module(cli_mod)
+            return cli_mod.run_memory_subcommand("help", "")
+    except Exception:
+        pass
+    return (
+        "Usage: /memory <subcommand>\n\n"
+        "Subcommands:\n"
+        "  init           — create ~/.hermes/memory/ directory tree\n"
+        "  health         — show plugin health and configuration\n"
+        "  db init        — initialize SQLite schema\n"
+        "  capture-test   — inject synthetic turn end-to-end\n"
+        "  ls-sessions    — list captured sessions\n"
+    )
 
 
 if __name__ == "__main__":

@@ -48,3 +48,7 @@ def resolve_source_ref(ref: str) -> Optional[SourceRef]:
 def format_source_ref(namespace: str, id: str) -> str:
     """Build a canonical source ref string."""
     return f"{namespace}:{id}"
+
+
+# Convenience alias — used throughout the codebase as ``from hermes_memory_core.source import resolve``
+resolve = resolve_source_ref

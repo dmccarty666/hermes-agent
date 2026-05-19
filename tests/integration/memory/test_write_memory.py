@@ -59,7 +59,8 @@ def memory_db_path(tmp_path):
         "(fact_id TEXT PRIMARY KEY, fact_text TEXT NOT NULL, content_hash TEXT NOT NULL UNIQUE, "
         "scope TEXT NOT NULL, project TEXT, status TEXT NOT NULL DEFAULT 'active', "
         "confidence REAL, hrr_vector BLOB, source_refs_json TEXT NOT NULL DEFAULT '[]', "
-        "entity_ids_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+        "entity_ids_json TEXT NOT NULL DEFAULT '[]', tags_json TEXT NOT NULL DEFAULT '[]', "
+        "created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_project ON facts(project)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_status ON facts(status)")
@@ -263,6 +264,46 @@ class TestWriteMemory_Fact:
         row = conn.execute("SELECT fact_text FROM facts WHERE fact_id = ?", (result["id"],)).fetchone()
         conn.close()
         assert row is not None, "fact should be in SQLite even if Qdrant failed"
+
+    def test_tags_stored_in_facts_table(self, memory_db_path):
+        """Tags parameter is stored as tags_json in facts table."""
+        result = write_memory(
+            "fact",
+            "Use Fly.io for all new deployments",
+            source_ref="test://t_181001a2/tags/test",
+            project="hermes-memory",
+            scope="project",
+            tags=["deploy", "infrastructure", "flyio"],
+        )
+        assert result["written"] is True
+
+        conn = sqlite3.connect(str(memory_db_path))
+        row = conn.execute(
+            "SELECT tags_json FROM facts WHERE fact_id = ?", (result["id"],)
+        ).fetchone()
+        conn.close()
+        assert row is not None, "fact row not found"
+        stored_tags = json.loads(row[0])
+        assert stored_tags == ["deploy", "infrastructure", "flyio"]
+
+    def test_tags_default_to_empty_array(self, memory_db_path):
+        """Tags column defaults to empty JSON array when tags=None."""
+        result = write_memory(
+            "fact",
+            "Hermes uses SQLite for memory storage",
+            source_ref="test://t_181001a2/tags/default",
+            project="hermes-memory",
+            scope="project",
+        )
+        assert result["written"] is True
+
+        conn = sqlite3.connect(str(memory_db_path))
+        row = conn.execute(
+            "SELECT tags_json FROM facts WHERE fact_id = ?", (result["id"],)
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert json.loads(row[0]) == []
 
 
 class TestWriteMemory_Redaction:

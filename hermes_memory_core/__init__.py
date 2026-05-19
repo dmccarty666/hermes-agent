@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS facts (
   hrr_vector           BLOB,
   source_refs_json     TEXT NOT NULL DEFAULT '[]',
   entity_ids_json      TEXT NOT NULL DEFAULT '[]',
+  tags_json            TEXT NOT NULL DEFAULT '[]',
   created_at           TEXT NOT NULL,
   updated_at           TEXT NOT NULL
 );
@@ -405,11 +406,13 @@ _singleton_db: Optional[MemoryDB] = None
 # Re-export from write.pipeline so callers can use a single import
 # ---------------------------------------------------------------------------
 
-from hermes_memory_core.write.pipeline import write_memory, MemoryWriteInput
+from hermes_memory_core.write.pipeline import write_memory, update_memory, fact_feedback, MemoryWriteInput
 
 __all__ = [
     "MemoryDB",
     "get_memory_db",
     "write_memory",
+    "update_memory",
+    "fact_feedback",
     "MemoryWriteInput",
 ]

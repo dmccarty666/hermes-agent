@@ -484,16 +484,20 @@ def write_memory(
             except Exception:
                 pass  # Non-fatal — HRR is optional
 
+            # Serialize tags to JSON
+            tags_json_val = json.dumps(tags) if tags else "[]"
+
             conn.execute(
                 """INSERT INTO facts
                    (fact_id, fact_text, content_hash, scope, project, status,
                     confidence, hrr_vector, source_refs_json, entity_ids_json,
-                    created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)
+                    tags_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (fact_id, redacted_text, content_hash, scope, project,
                  confidence if confidence is not None else 0.5,
-                 hrr_bytes, source_refs_json, entity_ids_json, now, now),
+                 hrr_bytes, source_refs_json, entity_ids_json,
+                 tags_json_val, now, now),
             )
             conn.commit()
             result_id = fact_id

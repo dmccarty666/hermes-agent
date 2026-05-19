@@ -1,0 +1,11 @@
+[Unit]
+Description=Hermes Local Memory — Dreamer (nightly session extraction)
+After=network.target
+
+[Service]
+Type=oneshot
+Environment=PYTHONPATH=/home/dmccarty/.hermes/hermes-agent
+ExecStart=/home/dmccarty/.hermes/hermes-agent/venv/bin/python -m hermes_memory_core.dream --scope since_last
+StandardOutput=journal
+StandardError=journal
+Environment=XDG_CACHE_HOME=/home/dmccarty/.cache

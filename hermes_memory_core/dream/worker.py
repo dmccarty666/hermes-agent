@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from hermes_memory_core.store.sqlite import MemoryDB
+from hermes_memory_core.dream.daily_memory import write_daily_memory
 
 logger = logging.getLogger(__name__)
 
@@ -652,6 +653,74 @@ class DreamWorker:
     # ------------------------------------------------------------------
     # Stage 9: record_dream_run
     # ------------------------------------------------------------------
+    # Stage 8b: daily memory file
+    # ------------------------------------------------------------------
+
+    def _update_daily_memory(
+        self,
+        session_ids: List[str],
+        facts: List[Dict[str, Any]],
+        decisions: List[Dict[str, Any]],
+        questions: List[Dict[str, Any]],
+    ) -> None:
+        """Write or update ~/.hermes/memories/YYYY-MM-DD.md.
+
+        Groups sessions by date and calls write_daily_memory per date.
+
+        Args:
+            session_ids: Session IDs processed in this run.
+            facts: Extracted facts (with source_ref).
+            decisions: Extracted decisions (with source_ref).
+            questions: Extracted questions (with source_ref).
+        """
+        try:
+            from datetime import date
+            conn = self.db._connect()
+            try:
+                # Get session metadata (date, title, project) for each session
+                placeholders = ",".join(["?"] * len(session_ids))
+                rows = conn.execute(
+                    f"""SELECT session_id, title, project, started_at
+                        FROM sessions WHERE session_id IN ({placeholders})""",
+                    session_ids,
+                ).fetchall()
+            finally:
+                conn.close()
+
+            # Group by date
+            by_date: Dict[str, List[Dict[str, Any]]] = {}
+            for row in rows:
+                sid, title, project, started_at = row
+                if started_at:
+                    d = date.fromisoformat(started_at[:10])
+                else:
+                    d = date.today()
+                date_str = d.isoformat()
+                if date_str not in by_date:
+                    by_date[date_str] = []
+                by_date[date_str].append({
+                    "session_id": sid,
+                    "title": title or "Untitled",
+                    "project": project or "",
+                })
+
+            # Write one file per date
+            for date_str, sessions in by_date.items():
+                d = date.fromisoformat(date_str)
+                write_daily_memory(
+                    d,
+                    sessions_processed=sessions,
+                    facts=facts,
+                    decisions=decisions,
+                    questions=questions,
+                )
+        except Exception as exc:
+            logger.warning("_update_daily_memory failed: %s — continuing", exc)
+            # Non-fatal: daily file write failure should not fail the whole dream run
+
+    # ------------------------------------------------------------------
+    # Stage 9: record_dream_run
+    # ------------------------------------------------------------------
 
     def record_dream_run(self, dream_run: DreamRun) -> None:
         """Record a dream run in the dream_runs audit table.
@@ -805,6 +874,9 @@ class DreamWorker:
         # Stage 8: update project memory
         source_ref = f"dream:{run_id}"
         counts = self.update_project_memory(all_facts, all_decisions, all_questions, source_ref)
+
+        # Stage 8b: update daily memory file (~/.hermes/memories/YYYY-MM-DD.md)
+        self._update_daily_memory(session_ids, all_facts, all_decisions, all_questions)
 
         # Finalize dream run
         dream_run.status = "completed"

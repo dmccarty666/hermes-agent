@@ -222,6 +222,45 @@ def _search_qdrant(
 
 
 # -------------------------------------------------------------------------- #
+# Weight redistribution (graceful degradation)
+# ---------------------------------------------------------------------------#
+
+def _redistribute_weights(
+    base_weights: Dict[str, float],
+    degraded: List[str],
+) -> Dict[str, float]:
+    """Redistribute weights when backends fail.
+
+    When one or more backends are unavailable, their weights are redistributed
+    proportionally to the remaining backends so the total = 1.0.
+
+    Phase 4 Story 4.1.2 — graceful degradation.
+    """
+    if not degraded:
+        return dict(base_weights)
+
+    available = {k: v for k, v in base_weights.items() if k not in degraded}
+    if not available:
+        # All backends down — return zeros with degraded标记
+        return {k: 0.0 for k in base_weights}
+
+    total_available = sum(available.values())
+    if total_available == 0.0:
+        return {k: 0.0 for k in base_weights}
+
+    # Redistribute degraded weights proportionally to available backends
+    redistributed = {}
+    for k, v in base_weights.items():
+        if k in degraded:
+            redistributed[k] = 0.0
+        else:
+            # Proportional share of the freed weight
+            redistributed[k] = v / total_available
+
+    return redistributed
+
+
+# -------------------------------------------------------------------------- #
 # Hybrid scorer logic
 # ---------------------------------------------------------------------------#
 
@@ -233,9 +272,11 @@ def _score(
     trust_score: float,
     freshness: float,
     mode: str,
+    weights: Optional[Dict[str, float]] = None,
 ) -> float:
     """Compute weighted combined score = sum(w * norm) * trust * freshness."""
-    weights = _MODE_WEIGHTS.get(mode, _DEFAULT_WEIGHTS)
+    if weights is None:
+        weights = _MODE_WEIGHTS.get(mode, _DEFAULT_WEIGHTS)
     relevance = (
         weights["fts"]      * fts_norm
         + weights["qdrant"]  * qdrant_norm
@@ -386,17 +427,17 @@ def search(
         - backend_weights: the weights used for this mode
         - degraded_modes: list of backends that failed (if any)
 
-    Phase 4 Story 4.1.1: integrates fts5_search and semantic_search.
-    Jaccard similarity is fully implemented.
-    HRR returns 0.0 (stub — full HRR in story 4.2).
+    Phase 4 Story 4.1.2 — graceful degradation: auto-redistribute weights when
+    a backend reports unavailable. Returns `degraded_modes: [...]` in response.
     """
     filters = filters or {}
     limit = max(1, limit)
     degraded_modes: List[str] = []
-    backend_weights = _MODE_WEIGHTS.get(mode, _DEFAULT_WEIGHTS)
+    base_weights = _MODE_WEIGHTS.get(mode, _DEFAULT_WEIGHTS)
 
     fts_raw: List[Dict[str, Any]] = []
     qdrant_raw: List[Dict[str, Any]] = []
+    hrr_score = 0.0
 
     try:
         fts_raw = _search_fts(query, filters, limit, memory_db)
@@ -410,12 +451,23 @@ def search(
         logger.warning("Qdrant backend failed: %s", exc)
         degraded_modes.append("qdrant")
 
+    # Check HRR availability (numpy required)
+    try:
+        from hermes_memory_core.search import hrr as _hrr_mod
+        if not getattr(_hrr_mod, "_HAS_NUMPY", True):
+            degraded_modes.append("hrr")
+    except Exception:
+        degraded_modes.append("hrr")
+
+    # Redistribute weights if any backends are down
+    effective_weights = _redistribute_weights(base_weights, degraded_modes)
+
     candidates = _dedup_results(fts_raw, qdrant_raw)
 
     scored: List[ScoredResult] = []
     for key, result in candidates.items():
         result.jaccard_score = jaccard_similarity(query, result.content)
-        result.hrr_score = 0.0
+        result.hrr_score = hrr_score
         if memory_db is not None:
             result.trust_score = _fetch_trust(memory_db, result.chunk_id)
         result.freshness_decay = freshness_decay(
@@ -429,6 +481,7 @@ def search(
             trust_score=result.trust_score,
             freshness=result.freshness_decay,
             mode=mode,
+            weights=effective_weights,
         )
         scored.append(result)
 
@@ -441,7 +494,7 @@ def search(
         "count": len(results_out),
         "mode": mode,
         "query": query,
-        "backend_weights": backend_weights,
+        "backend_weights": effective_weights,
         "degraded_modes": degraded_modes,
     }
 

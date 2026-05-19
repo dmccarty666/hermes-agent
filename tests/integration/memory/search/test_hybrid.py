@@ -360,6 +360,99 @@ class TestBackendDegradation:
                 assert result["count"] == 0
 
 
+class TestWeightRedistribution:
+    """Phase 4 Story 4.1.2 — graceful degradation weight redistribution."""
+
+    def test_no_degradation_returns_base_weights(self):
+        """When nothing is degraded, weights unchanged."""
+        from hermes_memory_core.search.hybrid import _redistribute_weights
+        base = {"fts": 0.30, "qdrant": 0.40, "jaccard": 0.15, "hrr": 0.15}
+        result = _redistribute_weights(base, [])
+        assert result == base
+
+    def test_qdrant_down_proportional_redistribution(self):
+        """Qdrant weight redistributed to fts, jaccard, hrr proportionally."""
+        from hermes_memory_core.search.hybrid import _redistribute_weights
+        base = {"fts": 0.30, "qdrant": 0.40, "jaccard": 0.15, "hrr": 0.15}
+        result = _redistribute_weights(base, ["qdrant"])
+        # qdrant → 0, rest redistributed so total = 1.0
+        assert result["qdrant"] == 0.0
+        # All available sum to 1.0
+        available_sum = sum(v for k, v in result.items() if k != "qdrant")
+        assert available_sum == pytest.approx(1.0)
+        # Relative proportions maintained: fts:jaccard:hrr = 0.30:0.15:0.15
+        # fts: 0.30/(0.30+0.15+0.15) = 0.30/0.60 = 0.50
+        assert result["fts"] == pytest.approx(0.50)
+        assert result["jaccard"] == pytest.approx(0.25)
+        assert result["hrr"] == pytest.approx(0.25)
+
+    def test_fts_down_proportional_redistribution(self):
+        """FTS weight redistributed to qdrant, jaccard, hrr proportionally."""
+        from hermes_memory_core.search.hybrid import _redistribute_weights
+        base = {"fts": 0.30, "qdrant": 0.40, "jaccard": 0.15, "hrr": 0.15}
+        result = _redistribute_weights(base, ["fts"])
+        assert result["fts"] == 0.0
+        available_sum = sum(v for k, v in result.items() if k != "fts")
+        assert available_sum == pytest.approx(1.0)
+        # qdrant gets 0.40/0.70, jaccard 0.15/0.70, hrr 0.15/0.70
+        assert result["qdrant"] == pytest.approx(0.40 / 0.70)
+        assert result["jaccard"] == pytest.approx(0.15 / 0.70)
+        assert result["hrr"] == pytest.approx(0.15 / 0.70)
+
+    def test_multiple_backends_down(self):
+        """When fts+qdrant down, jaccard+hrr split the full weight."""
+        from hermes_memory_core.search.hybrid import _redistribute_weights
+        base = {"fts": 0.30, "qdrant": 0.40, "jaccard": 0.15, "hrr": 0.15}
+        result = _redistribute_weights(base, ["fts", "qdrant"])
+        assert result["fts"] == 0.0
+        assert result["qdrant"] == 0.0
+        available_sum = result["jaccard"] + result["hrr"]
+        assert available_sum == pytest.approx(1.0)
+        # Equal split: both 0.50
+        assert result["jaccard"] == pytest.approx(0.50)
+        assert result["hrr"] == pytest.approx(0.50)
+
+    def test_all_backends_down_returns_zeros(self):
+        """All four backends down → all weights 0.0."""
+        from hermes_memory_core.search.hybrid import _redistribute_weights
+        base = {"fts": 0.30, "qdrant": 0.40, "jaccard": 0.15, "hrr": 0.15}
+        result = _redistribute_weights(base, ["fts", "qdrant", "jaccard", "hrr"])
+        for k in result:
+            assert result[k] == 0.0
+
+    def test_search_reports_degraded_modes_on_qdrant_failure(self):
+        """When Qdrant fails, degraded_modes includes 'qdrant' in response."""
+        with patch("hermes_memory_core.search.hybrid._search_fts") as mock_fts, \
+             patch("hermes_memory_core.search.hybrid._search_qdrant") as mock_qdr:
+            mock_fts.return_value = [make_fts_hit("c1", "s1", "fts content", -0.5)]
+            mock_qdr.side_effect = Exception("Qdrant unavailable")
+            result = search("fts content", mode="hybrid", filters={}, limit=10, memory_db=None)
+            assert "qdrant" in result["degraded_modes"]
+            # But results should still come from FTS
+            assert result["count"] >= 1
+
+    def test_search_reports_degraded_modes_on_fts_failure(self):
+        """When FTS fails, degraded_modes includes 'fts' in response."""
+        with patch("hermes_memory_core.search.hybrid._search_fts") as mock_fts, \
+             patch("hermes_memory_core.search.hybrid._search_qdrant") as mock_qdr:
+            mock_fts.side_effect = Exception("FTS unavailable")
+            mock_qdr.return_value = [make_qdrant_hit("c1", "s1", "qdrant content", 0.9)]
+            result = search("qdrant content", mode="hybrid", filters={}, limit=10, memory_db=None)
+            assert "fts" in result["degraded_modes"]
+            assert result["count"] >= 1
+
+    def test_backend_weights_reflects_redistribution(self):
+        """backend_weights in response is the redistributed set, not original."""
+        with patch("hermes_memory_core.search.hybrid._search_fts") as mock_fts, \
+             patch("hermes_memory_core.search.hybrid._search_qdrant") as mock_qdr:
+            mock_fts.return_value = [make_fts_hit("c1", "s1", "test", -0.5)]
+            mock_qdr.side_effect = Exception("Qdrant unavailable")
+            result = search("test", mode="hybrid", filters={}, limit=10, memory_db=None)
+            # qdrant's 0.40 weight should be redistributed
+            assert result["backend_weights"]["qdrant"] == 0.0
+            assert result["backend_weights"]["fts"] > 0.30  # gets some of qdrant's share
+
+
 class TestScoredResultFields:
     """Each result dict has all required fields."""
 

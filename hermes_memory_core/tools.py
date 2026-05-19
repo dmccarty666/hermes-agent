@@ -64,6 +64,32 @@ MEMORY_GET_SOURCE_SCHEMA: Dict[str, Any] = {
     },
 }
 
+MEMORY_DREAM_NOW_SCHEMA: Dict[str, Any] = {
+    "name": "memory_dream_now",
+    "description": (
+        "Trigger the nightly dreamer pipeline: extract facts, decisions, "
+        "and open questions from recent conversation sessions. "
+        "Runs the full 9-stage LLM-driven extraction pipeline. "
+        "Scope options: 'session' (with session_id), 'since_last' (default), 'all'."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "scope": {
+                "type": "string",
+                "enum": ["session", "since_last", "all"],
+                "default": "since_last",
+                "description": "Scope of sessions to process.",
+            },
+            "session_id": {
+                "type": "string",
+                "description": "Specific session_id when scope='session'.",
+            },
+        },
+        "required": [],
+    },
+}
+
 
 # ------------------------------------------------------------------
 # get_tool_schemas
@@ -71,7 +97,12 @@ MEMORY_GET_SOURCE_SCHEMA: Dict[str, Any] = {
 
 def get_tool_schemas() -> List[Dict[str, Any]]:
     """Return the list of tool schemas for Phase 2."""
-    return [MEMORY_QUERY_SCHEMA, MEMORY_GET_SOURCE_SCHEMA, MEMORY_RECENT_CONTEXT_SCHEMA]
+    return [
+        MEMORY_QUERY_SCHEMA,
+        MEMORY_GET_SOURCE_SCHEMA,
+        MEMORY_RECENT_CONTEXT_SCHEMA,
+        MEMORY_DREAM_NOW_SCHEMA,
+    ]
 
 
 # ------------------------------------------------------------------
@@ -86,6 +117,8 @@ def handle_tool_call(tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         return json.dumps(_handle_memory_get_source(args, **kwargs))
     if tool_name == "memory_recent_context":
         return json.dumps(_handle_memory_recent_context(args, **kwargs))
+    if tool_name == "memory_dream_now":
+        return json.dumps(_handle_memory_dream_now(args, **kwargs))
     return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
 
@@ -442,3 +475,57 @@ def _summarize_context_item(label: str, item: Dict[str, Any], kind: str) -> Dict
             "source_ref": f"dream:{item.get('dream_run_id', '')}",
         }
     return {}
+
+
+def _handle_memory_dream_now(args: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+    """Handle memory_dream_now tool call.
+
+    Triggers the full 9-stage dreamer pipeline.
+
+    Args:
+        args: Tool arguments (scope, session_id).
+        **kwargs: May contain memory_db for test isolation.
+
+    Returns:
+        Result dict with dream run status and counts.
+    """
+    from hermes_memory_core.dream.worker import DreamWorker
+
+    scope = args.get("scope", "since_last")
+    session_id = args.get("session_id")
+
+    worker = DreamWorker()
+    try:
+        result = worker.dream(scope=scope, session_id=session_id)
+        return {
+            "status": "completed",
+            "dream_run_id": result.dream_run.run_id,
+            "scope": result.dream_run.scope,
+            "facts_created": result.dream_run.facts_created,
+            "decisions_created": result.dream_run.decisions_created,
+            "questions_created": result.dream_run.questions_created,
+            "contradictions_detected": result.dream_run.contradictions_detected,
+            "session_summaries": [
+                {
+                    "session_id": s.session_id,
+                    "summary": s.summary[:500],  # truncate for brevity
+                    "facts_count": len(s.facts),
+                    "decisions_count": len(s.decisions),
+                    "questions_count": len(s.questions),
+                }
+                for s in result.session_summaries
+            ],
+        }
+    except Exception as exc:
+        logger.error("memory_dream_now failed: %s", exc, exc_info=True)
+        return {
+            "status": "failed",
+            "error": str(exc),
+            "dream_run_id": "",
+            "scope": scope,
+            "facts_created": 0,
+            "decisions_created": 0,
+            "questions_created": 0,
+            "contradictions_detected": 0,
+            "session_summaries": [],
+        }

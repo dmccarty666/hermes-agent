@@ -22,15 +22,56 @@ import hashlib
 import json
 import logging
 import sqlite3
+import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from hermes_memory_core.store import fs as fs_module
 from hermes_memory_core.store import sqlite as sqlite_module
+from hermes_memory_core.store.sqlite import MemoryDB
 from hermes_memory_core.write import redaction
 
 logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------/
+# Dataclasses — input types for write_memory
+# --------------------------------------------------------------------------/
+
+
+@dataclass
+class MemoryWriteInput:
+    """Structured input for write_memory.
+
+    Attributes:
+        memory_type:  One of "fact", "decision", "open_question".
+        text:         The memory text — always scanned for secrets before write.
+        source_ref:   Resolvable reference to the source (required).
+        project:      Optional project namespace.
+        scope:        One of "user", "project", "general" (facts only).
+        confidence:   Optional 0-1 confidence score.
+        tags:         Optional list of tag strings.
+        rationale:    Optional rationale (decisions only).
+        owner:        Optional owner (decisions only).
+        priority:     Optional priority (open_questions only).
+        force_no_redact: If True, skip redaction scan and log a redaction_override
+                        audit event. Use sparingly — the scanner always runs
+                        normally. Removed from MVP per v0.2-critique Issue 7.
+    """
+
+    memory_type: str
+    text: str
+    source_ref: str
+    project: Optional[str] = None
+    scope: Optional[str] = None
+    confidence: Optional[float] = None
+    tags: Optional[List[str]] = None
+    rationale: Optional[str] = None
+    owner: Optional[str] = None
+    priority: Optional[str] = None
+    force_no_redact: bool = False
 
 # Singleton instances — overridden in tests via _inject_for_test
 _memory_db: Optional["MemoryDB"] = None
@@ -354,6 +395,155 @@ def write_memory(
 ) -> Dict[str, Any]:
     """Write a durable memory item (fact / decision / open_question).
 
-    Phase 1 (T-007): stub — raises NotImplementedError.
+    Phase 4 (Story 4.4.1) — TDD §4.
+
+    Pipeline:
+      1. Validate inputs (source_ref required, memory_type in {fact, decision, open_question})
+      2. Redact secrets from text (always runs — skip_redact removed per Issue 7)
+      3. Compute content_hash (SHA-256 of redacted UTF-8)
+      4. Attempt INSERT (UNIQUE content_hash dedup on facts/decisions/open_questions)
+      5. Write audit_log row on redaction_fired or dedup_skip
+
+    Returns dict:
+      - written: bool — True if a new row was inserted
+      - skipped: bool — True if dedup blocked (content_hash existed)
+      - reason: str — 'new' | 'dedup' | error message
+      - source_ref: str — the source_ref used (echoed back)
+      - id: str — fact_id / decision_id / question_id (None if skipped/error)
+      - redaction_fired: bool
+      - redaction_types: list[str] (empty if no redaction)
     """
-    raise NotImplementedError("write_memory() — story T-009")
+    from hermes_memory_core.write.redaction import default_redactor
+    from hermes_memory_core import get_memory_db
+    import hashlib
+    import uuid
+
+    # ---- Step 1: validate memory_type ----
+    valid_types = {"fact", "decision", "open_question"}
+    if memory_type not in valid_types:
+        return {
+            "written": False,
+            "skipped": False,
+            "reason": f"invalid_memory_type: must be one of {sorted(valid_types)}",
+            "source_ref": source_ref or "",
+            "id": None,
+            "redaction_fired": False,
+            "redaction_types": [],
+        }
+
+    # ---- Step 2: source_ref required ----
+    if not source_ref:
+        return {
+            "written": False,
+            "skipped": False,
+            "reason": "missing_required_field: source_ref is required",
+            "source_ref": "",
+            "id": None,
+            "redaction_fired": False,
+            "redaction_types": [],
+        }
+
+    # ---- Step 3: redact ----
+    redaction_result = default_redactor.scan(text)
+    redacted_text = redaction_result.redacted_content
+    redaction_fired = redaction_result.fired
+    redaction_types = [hit.pattern_name for hit in redaction_result.hits]
+
+    # ---- Step 4: content_hash ----
+    content_hash = hashlib.sha256(redacted_text.encode("utf-8")).hexdigest()
+
+    # ---- Step 5: write to appropriate table ----
+    db = get_memory_db()
+    conn = db._connect()
+    now = datetime.now(timezone.utc).isoformat()
+
+    try:
+        if memory_type == "fact":
+            fact_id = f"fact_{uuid.uuid4().hex[:16]}"
+            source_refs_json = json.dumps([source_ref])
+            entity_ids_json = "[]"
+            conn.execute(
+                """INSERT INTO facts
+                   (fact_id, fact_text, content_hash, scope, project, status,
+                    confidence, source_refs_json, entity_ids_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
+                """,
+                (fact_id, redacted_text, content_hash, scope, project,
+                 confidence, source_refs_json, entity_ids_json, now, now),
+            )
+            conn.commit()
+            result_id = fact_id
+            reason = "new"
+
+        elif memory_type == "decision":
+            decision_id = f"decision_{uuid.uuid4().hex[:16]}"
+            source_refs_json = json.dumps([source_ref])
+            conn.execute(
+                """INSERT INTO decisions
+                   (decision_id, decision_text, rationale, project, owner, status,
+                    source_refs_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?)""",
+                (decision_id, redacted_text, rationale, project, owner,
+                 source_refs_json, now, now),
+            )
+            conn.commit()
+            result_id = decision_id
+            reason = "new"
+
+        else:  # open_question
+            question_id = f"question_{uuid.uuid4().hex[:16]}"
+            source_refs_json = json.dumps([source_ref])
+            conn.execute(
+                """INSERT INTO open_questions
+                   (question_id, question_text, project, priority, status,
+                    source_refs_json, next_action, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, 'open', ?, NULL, ?, ?)""",
+                (question_id, redacted_text, project, priority,
+                 source_refs_json, now, now),
+            )
+            conn.commit()
+            result_id = question_id
+            reason = "new"
+
+    except sqlite3.IntegrityError as exc:
+        conn.rollback()
+        # UNIQUE constraint violated → dedup skip
+        if "content_hash" in str(exc):
+            result_id = None
+            reason = "dedup"
+        else:
+            result_id = None
+            reason = f"integrity_error: {exc}"
+    finally:
+        conn.close()
+
+    # ---- Step 6: audit_log ----
+    if redaction_fired or reason == "dedup":
+        audit_detail = {
+            "memory_type": memory_type,
+            "content_hash": content_hash,
+            "source_ref": source_ref,
+            "redaction_fired": redaction_fired,
+            "redaction_types": redaction_types,
+            "skip_reason": reason,
+        }
+        try:
+            db.log_audit(
+                actor="plugin",
+                action="memory_write",
+                target_kind=memory_type,
+                target_id=result_id,
+                detail_json=json.dumps(audit_detail),
+            )
+        except Exception:
+            pass  # non-fatal — primary write succeeded
+
+    return {
+        "written": reason == "new",
+        "skipped": reason == "dedup",
+        "reason": reason,
+        "source_ref": source_ref,
+        "id": result_id,
+        "redaction_fired": redaction_fired,
+        "redaction_types": redaction_types,
+    }

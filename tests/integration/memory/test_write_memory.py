@@ -108,6 +108,27 @@ def memory_db_path(tmp_path):
 
 
 class TestWriteMemory_Fact:
+    def test_hrr_vector_computed_for_facts(self, memory_db_path):
+        """HRR vector is stored in the facts table (non-NULL)."""
+        result = write_memory(
+            "fact",
+            "Deploy to Fly.io on every push to main",
+            source_ref="test://t_4b709382/hrr",
+            project="hermes-memory",
+            scope="project",
+        )
+        assert result["written"] is True
+
+        conn = sqlite3.connect(str(memory_db_path))
+        row = conn.execute(
+            "SELECT hrr_vector FROM facts WHERE fact_id = ?", (result["id"],)
+        ).fetchone()
+        conn.close()
+        assert row is not None, "fact row not found"
+        assert row[0] is not None, "hrr_vector must be non-NULL for facts"
+        # Verify it's a valid bytes blob of the expected size (1024 floats * 8 bytes = 8192)
+        assert len(row[0]) == 8192, f"expected 8192 bytes for HRR_DIM=1024, got {len(row[0])}"
+
     def test_write_fact_creates_row(self, memory_db_path):
         """Fact write creates a row in facts table."""
         result = write_memory(
@@ -179,6 +200,69 @@ class TestWriteMemory_Fact:
         count = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
         conn.close()
         assert count == 1, "dedup should block second insert"
+
+    def test_qdrant_upsert_called_for_facts(self, memory_db_path, monkeypatch):
+        """Qdrant upsert is called after fact INSERT (non-fatal on error)."""
+        fake_points = []
+        captured_kwargs = {}
+
+        class FakeQdrantClient:
+            def __init__(self, **kwargs):
+                captured_kwargs.update(kwargs)
+
+            def upsert(self, collection_name, points):
+                fake_points.append({"collection": collection_name, "points": points})
+
+        import sys
+        # Patch the QdrantClient class in the qdrant_client module (imported inside pipeline)
+        import qdrant_client
+        monkeypatch.setattr(qdrant_client, "QdrantClient", FakeQdrantClient)
+
+        result = write_memory(
+            "fact",
+            "Use Qwen3.6-35B as the default delegated model",
+            source_ref="test://t_4b709382/qdrant",
+            project="hermes-memory",
+            scope="project",
+        )
+
+        assert result["written"] is True, f"Qdrant error should not block SQLite write: {result}"
+        assert len(fake_points) >= 1, "QdrantClient.upsert should have been called at least once"
+        point = fake_points[0]["points"][0]
+        # PointStruct payload access (not a dict)
+        payload = point.payload if hasattr(point, "payload") else {}
+        assert result["id"] in str(payload)
+        assert captured_kwargs.get("host") == "localhost"
+        assert captured_kwargs.get("port") == 6333
+
+    def test_qdrant_error_does_not_block_fact_write(self, memory_db_path, monkeypatch):
+        """Qdrant upsert failure is logged but does not prevent SQLite write."""
+
+        class BadQdrantClient:
+            def __init__(self, **kwargs):
+                pass
+
+            def upsert(self, collection_name, points):
+                raise RuntimeError("Qdrant unavailable")
+
+        import qdrant_client
+        monkeypatch.setattr(qdrant_client, "QdrantClient", BadQdrantClient)
+
+        result = write_memory(
+            "fact",
+            "SQLite is the source of truth",
+            source_ref="test://t_4b709382/qdrant_fail",
+            project="hermes-memory",
+            scope="project",
+        )
+
+        # Write must still succeed even if Qdrant throws
+        assert result["written"] is True, f"Qdrant failure should not block write: {result}"
+        # DB must have the fact
+        conn = sqlite3.connect(str(memory_db_path))
+        row = conn.execute("SELECT fact_text FROM facts WHERE fact_id = ?", (result["id"],)).fetchone()
+        conn.close()
+        assert row is not None, "fact should be in SQLite even if Qdrant failed"
 
 
 class TestWriteMemory_Redaction:

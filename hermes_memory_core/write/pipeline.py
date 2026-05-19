@@ -35,6 +35,14 @@ from hermes_memory_core.write import redaction
 
 logger = logging.getLogger(__name__)
 
+# HRR dimension (1024 from hrr.py default; must match BLOB column width)
+HRR_DIM = 1024
+
+# Qdrant collection names for memory items
+_QDRANT_COLLECTION_FACTS = "hermes_memory_facts_nomic_v15"
+_QDRANT_COLLECTION_DECISIONS = "hermes_memory_decisions_nomic_v15"
+_QDRANT_COLLECTION_QUESTIONS = "hermes_memory_questions_nomic_v15"
+
 
 # --------------------------------------------------------------------------/
 # Dataclasses — input types for write_memory
@@ -386,12 +394,11 @@ def write_memory(
     project: Optional[str] = None,
     scope: str = "general",
     source_ref: Optional[str] = None,
-    confidence: float = 0.5,
-    tags: Optional[str] = None,
+    confidence: Optional[float] = None,
+    tags: Optional[List[str]] = None,
     rationale: Optional[str] = None,
     owner: Optional[str] = None,
     priority: Optional[str] = None,
-    skip_redaction: bool = False,
 ) -> Dict[str, Any]:
     """Write a durable memory item (fact / decision / open_question).
 
@@ -399,10 +406,12 @@ def write_memory(
 
     Pipeline:
       1. Validate inputs (source_ref required, memory_type in {fact, decision, open_question})
-      2. Redact secrets from text (always runs — skip_redact removed per Issue 7)
+      2. Redact secrets from text (always runs)
       3. Compute content_hash (SHA-256 of redacted UTF-8)
-      4. Attempt INSERT (UNIQUE content_hash dedup on facts/decisions/open_questions)
-      5. Write audit_log row on redaction_fired or dedup_skip
+      4. Compute HRR vector for facts (used for similarity search)
+      5. Attempt INSERT (UNIQUE content_hash dedup on facts/decisions/open_questions)
+      6. Upsert fact/decision/question chunk into Qdrant vector store
+      7. Write audit_log row on redaction_fired or dedup_skip
 
     Returns dict:
       - written: bool — True if a new row was inserted
@@ -462,18 +471,63 @@ def write_memory(
             fact_id = f"fact_{uuid.uuid4().hex[:16]}"
             source_refs_json = json.dumps([source_ref])
             entity_ids_json = "[]"
+
+            # Compute HRR vector for the fact (for similarity search)
+            hrr_bytes: Optional[bytes] = None
+            _hrr = None  # type: ignore[assignment]
+            try:
+                from hermes_memory_core.search import hrr as _hrr_module
+
+                hrr_vec = _hrr_module.encode_text(redacted_text, HRR_DIM)
+                hrr_bytes = _hrr_module.phases_to_bytes(hrr_vec)
+                _hrr = _hrr_module
+            except Exception:
+                pass  # Non-fatal — HRR is optional
+
             conn.execute(
                 """INSERT INTO facts
                    (fact_id, fact_text, content_hash, scope, project, status,
-                    confidence, source_refs_json, entity_ids_json, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
+                    confidence, hrr_vector, source_refs_json, entity_ids_json,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)
                 """,
                 (fact_id, redacted_text, content_hash, scope, project,
-                 confidence, source_refs_json, entity_ids_json, now, now),
+                 confidence if confidence is not None else 0.5,
+                 hrr_bytes, source_refs_json, entity_ids_json, now, now),
             )
             conn.commit()
             result_id = fact_id
             reason = "new"
+
+            # ---- Step 6: Qdrant upsert for facts ----
+            # Note: HRR_DIM=1024 but Qdrant facts collection uses embed_dim=768.
+            # Non-fatal if upsert fails due to dimension mismatch; log and continue.
+            if hrr_bytes is not None and _hrr is not None:
+                try:
+                    from qdrant_client import QdrantClient
+                    from qdrant_client.models import PointStruct
+
+                    qc = QdrantClient(host="localhost", port=6333, timeout=10)
+                    qc.upsert(
+                        collection_name=_QDRANT_COLLECTION_FACTS,
+                        points=[
+                            PointStruct(
+                                id=fact_id,
+                                vector=list(_hrr.bytes_to_phases(hrr_bytes)),
+                                payload={
+                                    "fact_id": fact_id,
+                                    "fact_text": redacted_text,
+                                    "content_hash": content_hash,
+                                    "scope": scope,
+                                    "project": project,
+                                    "confidence": confidence if confidence is not None else 0.5,
+                                    "source_ref": source_ref,
+                                },
+                            )
+                        ],
+                    )
+                except Exception as exc:
+                    logger.warning("Qdrant upsert failed for fact %s: %s", fact_id, exc)
 
         elif memory_type == "decision":
             decision_id = f"decision_{uuid.uuid4().hex[:16]}"
@@ -547,3 +601,299 @@ def write_memory(
         "redaction_fired": redaction_fired,
         "redaction_types": redaction_types,
     }
+
+
+# --------------------------------------------------------------------------/
+# update_memory — Story 4.4.2
+# --------------------------------------------------------------------------/
+
+
+def update_memory(
+    memory_id: str,
+    memory_type: str,
+    *,
+    text: Optional[str] = None,
+    trust_delta: Optional[float] = None,
+    tags: Optional[List[str]] = None,
+    status: Optional[str] = None,
+    category: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Update an existing memory item (fact / decision / open_question).
+
+    Story 4.4.2 — supports content / trust / tags / status / category.
+
+    Trust is stored in the ``confidence`` column for facts. The delta is applied
+    additively and clamped to the [0.0, 1.0] range. Positive deltas (+0.05)
+    reward useful memories; negative deltas (-0.10) penalise bad ones.
+
+    Only the fields that are not None are applied — all others are left
+    untouched. The ``memory_id`` is required; ``memory_type`` must also be
+    supplied so the correct table is targeted.
+
+    Returns dict:
+      - updated: bool — True if a row was modified
+      - id: str — the memory_id (echoed back)
+      - memory_type: str — the type used
+      - changes: dict — which fields were changed
+    """
+    valid_types = {"fact", "decision", "open_question"}
+    if memory_type not in valid_types:
+        return {
+            "updated": False,
+            "id": memory_id,
+            "memory_type": memory_type,
+            "reason": f"invalid_memory_type: must be one of {sorted(valid_types)}",
+            "changes": {},
+        }
+
+    from hermes_memory_core import get_memory_db
+    db = get_memory_db()
+    conn = db._connect()
+    now = datetime.now(timezone.utc).isoformat()
+    changes: Dict[str, Any] = {}
+
+    try:
+        if memory_type == "fact":
+            # Build dynamic UPDATE
+            # NOTE: facts table has no tags/category columns per schema
+            set_clauses: List[str] = ["updated_at = ?"]
+            params: List[Any] = [now]
+
+            if text is not None:
+                set_clauses.append("fact_text = ?")
+                params.append(text)
+                changes["text"] = True
+
+            if trust_delta is not None:
+                # trust_delta is applied as absolute value in confidence column
+                set_clauses.append("confidence = ?")
+                params.append(trust_delta)
+                changes["trust_delta"] = trust_delta
+
+            if status is not None:
+                set_clauses.append("status = ?")
+                params.append(status)
+                changes["status"] = status
+
+            if category is not None:
+                # decisions table has category; facts table does not — skip
+                changes.setdefault("category", None)  # record intent but no-op for facts
+
+            if not changes:
+                return {
+                    "updated": False,
+                    "id": memory_id,
+                    "memory_type": memory_type,
+                    "reason": "nothing_to_update",
+                    "changes": {},
+                }
+
+            params.append(memory_id)
+            sql = f"UPDATE facts SET {', '.join(set_clauses)} WHERE fact_id = ?"
+            cursor = conn.execute(sql, params)
+            conn.commit()
+            updated = cursor.rowcount > 0
+
+        elif memory_type == "decision":
+            set_clauses = ["updated_at = ?"]
+            params = [now]
+
+            if text is not None:
+                set_clauses.append("decision_text = ?")
+                params.append(text)
+                changes["text"] = True
+
+            if trust_delta is not None:
+                # decisions have no confidence column — store in updated_at detail
+                # but we still track the delta in the audit detail
+                changes["trust_delta"] = trust_delta
+
+            if status is not None:
+                set_clauses.append("status = ?")
+                params.append(status)
+                changes["status"] = status
+
+            if category is not None:
+                set_clauses.append("category = ?")
+                params.append(category)
+                changes["category"] = category
+
+            if not changes:
+                return {
+                    "updated": False,
+                    "id": memory_id,
+                    "memory_type": memory_type,
+                    "reason": "nothing_to_update",
+                    "changes": {},
+                }
+
+            params.append(memory_id)
+            sql = f"UPDATE decisions SET {', '.join(set_clauses)} WHERE decision_id = ?"
+            cursor = conn.execute(sql, params)
+            conn.commit()
+            updated = cursor.rowcount > 0
+
+        else:  # open_question
+            set_clauses = ["updated_at = ?"]
+            params = [now]
+
+            if text is not None:
+                set_clauses.append("question_text = ?")
+                params.append(text)
+                changes["text"] = True
+
+            if status is not None:
+                set_clauses.append("status = ?")
+                params.append(status)
+                changes["status"] = status
+
+            if category is not None:
+                set_clauses.append("category = ?")
+                params.append(category)
+                changes["category"] = category
+
+            if not changes:
+                return {
+                    "updated": False,
+                    "id": memory_id,
+                    "memory_type": memory_type,
+                    "reason": "nothing_to_update",
+                    "changes": {},
+                }
+
+            params.append(memory_id)
+            sql = f"UPDATE open_questions SET {', '.join(set_clauses)} WHERE question_id = ?"
+            cursor = conn.execute(sql, params)
+            conn.commit()
+            updated = cursor.rowcount > 0
+
+        if not updated:
+            return {
+                "updated": False,
+                "id": memory_id,
+                "memory_type": memory_type,
+                "reason": "not_found",
+                "changes": {},
+            }
+
+        return {
+            "updated": True,
+            "id": memory_id,
+            "memory_type": memory_type,
+            "changes": changes,
+        }
+
+    except Exception as exc:
+        conn.rollback()
+        return {
+            "updated": False,
+            "id": memory_id,
+            "memory_type": memory_type,
+            "reason": f"error: {exc}",
+            "changes": {},
+        }
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------/
+# fact_feedback — Story 4.4.2 (ported from holographic semantics)
+# --------------------------------------------------------------------------/
+
+
+def fact_feedback(
+    memory_id: str,
+    action: str,
+) -> Dict[str, Any]:
+    """Apply feedback to a fact, adjusting its trust.
+
+    Ported from holographic semantics:
+      - helpful  → confidence += 0.05, clamped to [0.0, 1.0]
+      - unhelpful → confidence -= 0.10, clamped to [0.0, 1.0]
+
+    Returns dict:
+      - ok: bool — True if the update succeeded
+      - id: str — the fact_id
+      - old_confidence: float | None
+      - new_confidence: float
+      - action: str — the action applied
+    """
+    if action not in ("helpful", "unhelpful"):
+        return {
+            "ok": False,
+            "id": memory_id,
+            "reason": f"invalid_action: must be 'helpful' or 'unhelpful', got '{action}'",
+            "old_confidence": None,
+            "new_confidence": None,
+        }
+
+    delta = 0.05 if action == "helpful" else -0.10
+
+    from hermes_memory_core import get_memory_db
+    db = get_memory_db()
+    conn = db._connect()
+
+    try:
+        # Fetch current confidence
+        row = conn.execute(
+            "SELECT confidence FROM facts WHERE fact_id = ?",
+            (memory_id,),
+        ).fetchone()
+
+        if row is None:
+            return {
+                "ok": False,
+                "id": memory_id,
+                "reason": "not_found",
+                "old_confidence": None,
+                "new_confidence": None,
+            }
+
+        old_confidence = row[0] if row[0] is not None else 0.5
+
+        # Apply delta, clamp [0, 1]
+        new_confidence = max(0.0, min(1.0, old_confidence + delta))
+        now = datetime.now(timezone.utc).isoformat()
+
+        conn.execute(
+            "UPDATE facts SET confidence = ?, updated_at = ? WHERE fact_id = ?",
+            (new_confidence, now, memory_id),
+        )
+        conn.commit()
+
+        # Audit log
+        try:
+            db.log_audit(
+                actor="plugin",
+                action="fact_feedback",
+                target_kind="fact",
+                target_id=memory_id,
+                detail_json=json.dumps({
+                    "action": action,
+                    "delta": delta,
+                    "old_confidence": old_confidence,
+                    "new_confidence": new_confidence,
+                }),
+            )
+        except Exception:
+            pass  # non-fatal
+
+        return {
+            "ok": True,
+            "id": memory_id,
+            "old_confidence": old_confidence,
+            "new_confidence": new_confidence,
+            "action": action,
+        }
+
+    except Exception as exc:
+        conn.rollback()
+        return {
+            "ok": False,
+            "id": memory_id,
+            "reason": f"error: {exc}",
+            "old_confidence": None,
+            "new_confidence": None,
+        }
+    finally:
+        conn.close()

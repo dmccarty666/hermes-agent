@@ -8230,14 +8230,16 @@ class GatewayRunner:
         # Inject narrative thread into the new session's MemoryManager via
         # on_session_switch.  Unlike the CLI which calls on_session_switch
         # directly in its /new handler, the gateway routes both /new and
-        # /reset through _handle_reset_command.  We use reset=False (narrative
-        # thread preserved) for both since the narrative thread injection is
-        # the desired behaviour for either command when using hermes-local.
+        # /reset through _handle_reset_command.  Distinguish via event.get_command():
+        # - /new (canonical "new"): reset=False — preserve narrative thread
+        # - /reset (canonical "reset"): reset=True — fresh session, no injection
         # The old agent still has _memory_manager set because we evict from
         # the cache AFTER this block but BEFORE the new agent is created.
         try:
             _old_sid = old_entry.session_id if old_entry else None
             _new_sid = new_entry.session_id if new_entry else None
+            _cmd = event.get_command()
+            _is_reset = _cmd == "reset"
             # _old_agent is set in the cache-lock block above (line 8112).
             # Use getattr with a sentinel to avoid "possibly unbound" warning.
             _sentinel = object()
@@ -8247,7 +8249,7 @@ class GatewayRunner:
                 _mm.on_session_switch(
                     _new_sid,
                     parent_session_id=_old_sid or "",
-                    reset=False,
+                    reset=_is_reset,
                     reason="gateway_reset",
                 )
         except Exception:

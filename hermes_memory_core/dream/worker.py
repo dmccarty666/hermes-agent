@@ -215,7 +215,14 @@ class DreamWorker:
         store=None,      # MemoryStore; uses singleton if None
         db=None,         # alias for store (test compatibility)
         dry_run: bool = False,
+        llm_endpoint: str = "",
+        llm_model: str = "",
     ) -> None:
+        global DREAM_LLM_URL, DREAM_LLM_MODEL
+        if llm_endpoint:
+            DREAM_LLM_URL = llm_endpoint.rstrip("/") + "/v1"
+        if llm_model:
+            DREAM_LLM_MODEL = llm_model
         self.store = (db if db is not None else None) or store or get_memory_store()
         self.db = self.store  # test-compatible attribute
         self.dry_run = dry_run

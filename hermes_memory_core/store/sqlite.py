@@ -299,6 +299,11 @@ class MemoryStore:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
             conn.executescript(_SCHEMA_SQL)
+            # Migration: add trust_score column to pre-existing DBs that lack it
+            try:
+                conn.execute("ALTER TABLE facts ADD COLUMN trust_score REAL DEFAULT 0.5")
+            except sqlite3.OperationalError:
+                pass  # column already exists or table freshly created
             # Record schema version
             try:
                 conn.execute(

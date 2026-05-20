@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from hermes_memory_core.search.fts5 import fts5_search
@@ -495,8 +496,19 @@ def _handle_memory_dream_now(args: Dict[str, Any], **kwargs) -> Dict[str, Any]:
     session_id = args.get("session_id")
 
     worker = DreamWorker()
+    started_at = datetime.now(timezone.utc).isoformat()
     try:
         result = worker.dream(scope=scope, session_id=session_id)
+        ended_at = datetime.now(timezone.utc).isoformat()
+
+        # Write dream report to disk (Stage 9)
+        try:
+            from hermes_memory_core.dream.report_writer import write_dream_report
+            report_path = write_dream_report(result, started_at, ended_at)
+            logger.info("Dream report written to %s", report_path)
+        except Exception as rep_exc:
+            logger.warning("Failed to write dream report: %s", rep_exc)
+
         return {
             "status": "completed",
             "dream_run_id": result.dream_run.run_id,
@@ -517,6 +529,7 @@ def _handle_memory_dream_now(args: Dict[str, Any], **kwargs) -> Dict[str, Any]:
             ],
         }
     except Exception as exc:
+        ended_at = datetime.now(timezone.utc).isoformat()
         logger.error("memory_dream_now failed: %s", exc, exc_info=True)
         return {
             "status": "failed",

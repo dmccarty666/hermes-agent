@@ -183,7 +183,7 @@ class TestSchemaInit:
             cur = conn.execute("SELECT version, notes FROM schema_version")
             rows = cur.fetchall()
         assert len(rows) == 1
-        assert rows[0][0] == 1
+        assert rows[0][0] == 2
         assert "initial" in (rows[0][1] or "").lower()
 
 
@@ -200,7 +200,7 @@ class TestIdempotentRerun:
         db.initialize()  # should not raise
         with sqlite3.connect(fresh_db) as conn:
             cur = conn.execute("SELECT version FROM schema_version")
-            assert cur.fetchone()[0] == 1
+            assert cur.fetchone()[0] == 2
 
     def test_third_init_still_no_op(self, fresh_db):
         db = MemoryDB(db_path=fresh_db)

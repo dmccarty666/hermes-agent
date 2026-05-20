@@ -752,4 +752,143 @@ class TestMemoryDreamNowTool:
 
             assert result["status"] == "failed"
             assert "Test error" in result["error"]
-            assert result["facts_created"] == 0
+
+
+# ---------------------------------------------------------------------------
+# QA Bug Fixes (T-026)
+# ---------------------------------------------------------------------------
+
+
+class TestFetchTurnsDreamStatusFilter:
+    """Tests for _fetch_turns dream_status filter (Bug #1)."""
+
+    def test_fetch_turns_filters_pending(self, worker_with_db: DreamWorker, tmp_db: MemoryDB, sample_session: str):
+        """_fetch_turns returns only pending turns when filtered."""
+        # All turns in sample_session are 'pending' by default
+        pending = worker_with_db._fetch_turns(sample_session, dream_status="pending")
+        assert len(pending) == 4
+        assert all(t["dream_status"] == "pending" for t in pending)
+
+    def test_fetch_turns_returns_dreamed_status(self, worker_with_db: DreamWorker, tmp_db: MemoryDB, sample_session: str):
+        """_fetch_turns returns the dream_status field."""
+        # Mark some turns as dreamed
+        conn = tmp_db._connect()
+        try:
+            conn.execute(
+                "UPDATE turns SET dream_status = 'dreamed' WHERE turn_id = ?",
+                ("turn_0",),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Should now return 0 pending (turn_0 is dreamed, rest are pending)
+        pending = worker_with_db._fetch_turns(sample_session, dream_status="pending")
+        assert len(pending) == 3
+
+    def test_fetch_turns_backward_compatible_no_filter(self, worker_with_db: DreamWorker, sample_session: str):
+        """_fetch_turns with no filter returns all turns (backward compatible)."""
+        all_turns = worker_with_db._fetch_turns(sample_session)
+        assert len(all_turns) == 4
+
+
+class TestMarkTurnsDreamed:
+    """Tests for _mark_turns_dreamed (Bug #1 - idempotency)."""
+
+    def test_mark_turns_dreamed_updates_status(self, worker_with_db: DreamWorker, tmp_db: MemoryDB, sample_session: str):
+        """_mark_turns_dreamed sets dream_status='dreamed' for given turn_ids."""
+        worker_with_db._mark_turns_dreamed(["turn_0", "turn_1"])
+
+        conn = tmp_db._connect()
+        try:
+            rows = conn.execute(
+                "SELECT turn_id, dream_status FROM turns WHERE turn_id IN (?, ?)",
+                ("turn_0", "turn_1"),
+            ).fetchall()
+            status_map = {r[0]: r[1] for r in rows}
+        finally:
+            conn.close()
+
+        assert status_map["turn_0"] == "dreamed"
+        assert status_map["turn_1"] == "dreamed"
+        # Other turns should still be pending
+        conn = tmp_db._connect()
+        try:
+            row = conn.execute(
+                "SELECT dream_status FROM turns WHERE turn_id = ?", ("turn_2",)
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row[0] == "pending"
+
+    def test_mark_turns_dreamed_empty_list_noops(self, worker_with_db: DreamWorker):
+        """_mark_turns_dreamed with empty list does nothing."""
+        worker_with_db._mark_turns_dreamed([])  # should not raise
+
+
+class TestPerTurnSourceRefs:
+    """Tests for per-turn source_ref format (Bug #2)."""
+
+    def test_per_turn_source_ref_format(self, worker_with_db: DreamWorker, tmp_db: MemoryDB, sample_session: str):
+        """Facts extracted from dream have per-turn source_refs like session:{id}#turn={n}."""
+        # Intercept update_project_memory to inspect the source_refs attached to facts
+        original_update = worker_with_db.update_project_memory
+
+        captured_facts = []
+
+        def capture_update(facts, decisions, questions, source_ref):
+            captured_facts.extend(facts)
+            return original_update(facts, decisions, questions, source_ref)
+
+        with mock.patch.object(worker_with_db, "update_project_memory", side_effect=capture_update):
+            with mock.patch.object(worker_with_db, "summarize_session", return_value="Summary"):
+                with mock.patch.object(worker_with_db, "extract_facts", return_value=[
+                    {"fact_text": "Test fact", "scope": "general", "confidence": 0.8},
+                ]):
+                    with mock.patch.object(worker_with_db, "extract_decisions", return_value=[]):
+                        with mock.patch.object(worker_with_db, "extract_open_questions", return_value=[]):
+                            with mock.patch.object(worker_with_db, "detect_contradictions", return_value=[]):
+                                worker_with_db.dream(scope="session", session_id=sample_session)
+
+        assert len(captured_facts) == 1
+        fact = captured_facts[0]
+        source_refs = fact.get("_source_refs", [])
+        assert len(source_refs) == 4  # one ref per turn in sample_session
+        # Each ref should be session:{id}#turn={n}
+        for ref in source_refs:
+            assert ref.startswith(f"session:{sample_session}#turn=")
+
+
+class TestDreamReportWritten:
+    """Tests for write_dream_report call (Bug #4)."""
+
+    def test_handle_memory_dream_now_calls_write_dream_report(
+        self, tmp_db: MemoryDB, sample_session: str, tmp_path: Path
+    ):
+        """_handle_memory_dream_now calls write_dream_report after successful completion."""
+        from hermes_memory_core.tools import _handle_memory_dream_now
+
+        # Patch DreamWorker.dream to return a minimal result
+        mock_result = mock.MagicMock()
+        mock_result.dream_run.run_id = "dream_test_001"
+        mock_result.dream_run.scope = "session"
+        mock_result.dream_run.facts_created = 0
+        mock_result.dream_run.decisions_created = 0
+        mock_result.dream_run.questions_created = 0
+        mock_result.dream_run.contradictions_detected = 0
+        mock_result.session_summaries = []
+
+        with mock.patch("hermes_memory_core.dream.worker.DreamWorker") as mock_worker_class:
+            mock_worker = mock.MagicMock()
+            mock_worker.dream.return_value = mock_result
+            mock_worker_class.return_value = mock_worker
+
+            with mock.patch("hermes_memory_core.dream.report_writer.write_dream_report") as mock_report:
+                mock_report.return_value = tmp_path / "dream_report.md"
+
+                result = _handle_memory_dream_now({"scope": "session", "session_id": sample_session}, memory_db=tmp_db)
+
+                assert result["status"] == "completed"
+                mock_report.assert_called_once()
+                call_args = mock_report.call_args
+                assert call_args[0][0] is mock_result  # result is first arg

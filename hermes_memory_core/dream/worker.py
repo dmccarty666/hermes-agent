@@ -305,23 +305,34 @@ class DreamWorker:
     # Stage 2: fetch_turns
     # ------------------------------------------------------------------
 
-    def _fetch_turns(self, session_id: str) -> List[Dict[str, Any]]:
+    def _fetch_turns(
+        self, session_id: str, dream_status: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         """Load conversation turns for a session from SQLite.
 
         Args:
             session_id: Session to load turns for.
+            dream_status: If provided, only return turns with this dream_status
+                          (e.g. 'pending'). If None, return all turns.
 
         Returns:
             List of turn dicts (ordered by sequence).
         """
         conn = self.db._connect()
         try:
-            rows = conn.execute(
-                "SELECT turn_id, sequence, timestamp, role, content "
-                "FROM turns WHERE session_id = ? "
-                "ORDER BY sequence ASC",
-                (session_id,),
-            ).fetchall()
+            if dream_status is not None:
+                rows = conn.execute(
+                    "SELECT turn_id, sequence, timestamp, role, content, dream_status "
+                    "FROM turns WHERE session_id = ? AND dream_status = ? "
+                    "ORDER BY sequence ASC",
+                    (session_id, dream_status),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT turn_id, sequence, timestamp, role, content, dream_status "
+                    "FROM turns WHERE session_id = ? ORDER BY sequence ASC",
+                    (session_id,),
+                ).fetchall()
             return [
                 {
                     "turn_id": r[0],
@@ -329,9 +340,105 @@ class DreamWorker:
                     "timestamp": r[2],
                     "role": r[3],
                     "content": r[4] or "",
+                    "dream_status": r[5],
                 }
                 for r in rows
             ]
+        finally:
+            conn.close()
+
+    def _mark_turns_dreamed(self, turn_ids: List[str]) -> None:
+        """Mark turns as dreamed in SQLite.
+
+        Args:
+            turn_ids: List of turn_id values to mark as 'dreamed'.
+        """
+        if not turn_ids:
+            return
+        conn = self.db._connect()
+        try:
+            placeholders = ",".join(["?"] * len(turn_ids))
+            conn.execute(
+                f"UPDATE turns SET dream_status = 'dreamed' WHERE turn_id IN ({placeholders})",
+                turn_ids,
+            )
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            logger.warning("_mark_turns_dreamed failed: %s", exc)
+        finally:
+            conn.close()
+
+    def _mark_disputed_facts(
+        self,
+        contradictions: List[Dict[str, Any]],
+        all_facts: List[Dict[str, Any]],
+    ) -> None:
+        """Mark disputed facts in SQLite using contradiction results.
+
+        Iterates through LLM-returned contradictions and looks up the corresponding
+        new fact IDs (from the _created_fact_ids mapping set by update_project_memory)
+        and marks them as 'disputed' with supersedes_fact_id set.
+
+        Args:
+            contradictions: List of contradiction dicts from detect_contradictions.
+            all_facts: List of fact dicts extracted in this dream run.
+        """
+        from hermes_memory_core.dream.contradict import mark_disputed
+
+        created_ids = getattr(self, "_created_fact_ids", {})
+        if not created_ids:
+            return
+
+        # Build a fact_text -> scope mapping for quick lookup
+        fact_text_to_scope: Dict[str, str] = {}
+        for f in all_facts:
+            txt = f.get("fact_text", f.get("text", ""))
+            scope = f.get("scope", "general")
+            if txt:
+                fact_text_to_scope[txt] = scope
+
+        conn = self.db._connect()
+        try:
+            for conflict in contradictions:
+                # LLM returns fact_a (new/candidate) and fact_b (existing)
+                fact_a_text = conflict.get("fact_a", "")
+                if not fact_a_text:
+                    continue
+
+                # Look up the new fact's ID from the created IDs mapping
+                scope = fact_text_to_scope.get(fact_a_text, "general")
+                candidate_key = (fact_a_text, scope)
+                candidate_fact_id = created_ids.get(candidate_key)
+                if not candidate_fact_id:
+                    continue
+
+                # Get the existing fact ID (from the DB, referenced by text in conflict)
+                existing_text = conflict.get("fact_b", "")
+                if not existing_text:
+                    continue
+
+                # Look up existing fact by text in the DB
+                rows = conn.execute(
+                    "SELECT fact_id FROM facts WHERE fact_text = ? LIMIT 1",
+                    (existing_text,),
+                ).fetchall()
+                if not rows:
+                    continue
+                existing_fact_id = rows[0][0]
+
+                # Mark the candidate (new) fact as disputed
+                mark_disputed(conn, candidate_fact_id, existing_fact_id)
+                logger.info(
+                    "Marked fact %s as disputed (supersedes %s)",
+                    candidate_fact_id,
+                    existing_fact_id,
+                )
+
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            logger.warning("_mark_disputed_facts failed: %s", exc)
         finally:
             conn.close()
 
@@ -547,10 +654,14 @@ class DreamWorker:
 
         Returns:
             Dict with counts: facts_created, decisions_created, questions_created.
+            Also sets ._created_fact_ids mapping {(fact_text, scope): fact_id}
+            for use by contradiction detection.
         """
         conn = self.db._connect()
         now = datetime.now(timezone.utc).isoformat()
         counts = {"facts_created": 0, "decisions_created": 0, "questions_created": 0}
+        # Track created fact IDs for contradiction detection
+        self._created_fact_ids: Dict[tuple, str] = {}
 
         try:
             # Write facts
@@ -563,7 +674,8 @@ class DreamWorker:
                 scope = fact.get("scope", "general")
                 confidence = fact.get("confidence", 0.5)
                 tags = json.dumps(fact.get("tags", []))
-                source_refs_json = json.dumps([source_ref])
+                # Use per-turn source_refs if attached, otherwise fall back to run-level ref
+                source_refs_json = json.dumps(fact.get("_source_refs", [source_ref]))
                 # Generate a content hash for the fact
                 content_hash = hashlib.sha256(fact_text.encode()).hexdigest()[:32]
                 conn.execute(
@@ -585,6 +697,8 @@ class DreamWorker:
                     ),
                 )
                 counts["facts_created"] += 1
+                # Track for contradiction detection
+                self._created_fact_ids[(fact_text, scope)] = fact_id
 
             # Write decisions
             for dec in decisions:
@@ -595,7 +709,7 @@ class DreamWorker:
                 rationale = dec.get("rationale", "")
                 project = dec.get("project", "")
                 owner = dec.get("owner", "")
-                source_refs_json = json.dumps([source_ref])
+                source_refs_json = json.dumps(dec.get("_source_refs", [source_ref]))
                 conn.execute(
                     """INSERT INTO decisions
                        (decision_id, decision_text, rationale, project, owner,
@@ -622,7 +736,7 @@ class DreamWorker:
                 question_id = f"question_{uuid.uuid4().hex[:16]}"
                 project = q.get("project", "")
                 priority = q.get("priority", "medium")
-                source_refs_json = json.dumps([source_ref])
+                source_refs_json = json.dumps(q.get("_source_refs", [source_ref]))
                 conn.execute(
                     """INSERT INTO open_questions
                        (question_id, question_text, project, priority,
@@ -803,11 +917,14 @@ class DreamWorker:
             self.record_dream_run(dream_run)
             return DreamResult(dream_run=dream_run)
 
-        # Stage 2: fetch turns for each session
+        # Stage 2: fetch ONLY pending turns for each session (idempotency)
         all_turns: Dict[str, List[Dict[str, Any]]] = {}
         for sid in session_ids:
-            turns = self._fetch_turns(sid)
+            turns = self._fetch_turns(sid, dream_status="pending")
             all_turns[sid] = turns
+
+        # Collect all processed turn IDs for idempotency marking
+        all_processed_turn_ids: List[str] = []
 
         # Stages 3-6: process each session
         summaries: List[SessionSummary] = []
@@ -820,19 +937,34 @@ class DreamWorker:
             if not turns:
                 continue
 
+            # Track turn IDs for idempotency
+            turn_ids_this_session = [t["turn_id"] for t in turns]
+            all_processed_turn_ids.extend(turn_ids_this_session)
+
+            # Per-turn source_refs: build a set of all turn sequences for this session
+            # so we can include them in the session-level source_ref
+            turn_refs = [f"session:{sid}#turn={t['sequence']}" for t in turns]
+
             # Stage 3: summarize
             summary_text = self.summarize_session(sid, turns)
 
             # Stage 4: extract facts
             facts = self.extract_facts(turns)
+            for f in facts:
+                # Attach per-session source_refs pointing to all turns in this session
+                f["_source_refs"] = turn_refs
             all_facts.extend(facts)
 
             # Stage 5: extract decisions
             decisions = self.extract_decisions(turns)
+            for d in decisions:
+                d["_source_refs"] = turn_refs
             all_decisions.extend(decisions)
 
             # Stage 6: extract questions
             questions = self.extract_open_questions(turns)
+            for q in questions:
+                q["_source_refs"] = turn_refs
             all_questions.extend(questions)
 
             summaries.append(
@@ -844,6 +976,9 @@ class DreamWorker:
                     questions=questions,
                 )
             )
+
+        # Mark all processed turns as 'dreamed' (idempotency)
+        self._mark_turns_dreamed(all_processed_turn_ids)
 
         # Stage 7: detect contradictions (compare with existing memory)
         existing_facts = []
@@ -871,9 +1006,14 @@ class DreamWorker:
 
         contradictions = self.detect_contradictions(summaries, existing_facts)
 
-        # Stage 8: update project memory
+        # Stage 8: update project memory (uses run-level source_ref; per-turn refs attached via _source_refs)
         source_ref = f"dream:{run_id}"
         counts = self.update_project_memory(all_facts, all_decisions, all_questions, source_ref)
+
+        # Wire up contradictory facts: mark disputed facts in DB
+        # The contradictions list contains {fact_a, fact_b, ...} where fact_a/b are texts
+        if contradictions:
+            self._mark_disputed_facts(contradictions, all_facts)
 
         # Stage 8b: update daily memory file (~/.hermes/memories/YYYY-MM-DD.md)
         self._update_daily_memory(session_ids, all_facts, all_decisions, all_questions)

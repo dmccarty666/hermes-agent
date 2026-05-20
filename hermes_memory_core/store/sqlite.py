@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 _MEMORY_SQLITE_NAME = "memory.sqlite"
 
 # Current schema version
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # PRAGMA settings applied on every fresh connection
 _PRAGMAS = """
@@ -121,10 +121,12 @@ CREATE TABLE IF NOT EXISTS facts (
   scope                TEXT NOT NULL,
   project              TEXT,
   status               TEXT NOT NULL DEFAULT 'active',
+  supersedes_fact_id   TEXT,
   confidence           REAL,
   hrr_vector           BLOB,
   source_refs_json     TEXT NOT NULL DEFAULT '[]',
   entity_ids_json      TEXT NOT NULL DEFAULT '[]',
+  tags_json            TEXT NOT NULL DEFAULT '[]',
   created_at           TEXT NOT NULL,
   updated_at           TEXT NOT NULL
 );
@@ -409,13 +411,14 @@ class MemoryDB:
             "SELECT name FROM sqlite_master "
             "WHERE type='table' AND name='schema_version'"
         )
+        already_current = False
         if cur.fetchone():
             # Schema already applied — check version
             row = conn.execute(
                 "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"
             ).fetchone()
             if row and row[0] >= SCHEMA_VERSION:
-                return  # already at current version — no-op
+                already_current = True
 
         # Apply schema — DDL executes an implicit COMMIT that resets
         # synchronous to default (2) and resets busy_timeout to 0.
@@ -446,13 +449,32 @@ class MemoryDB:
                         if stmt:
                             conn.execute(stmt)
 
-            # Insert schema version row
-            applied_at = datetime.now(timezone.utc).isoformat()
-            conn.execute(
-                "INSERT INTO schema_version (applied_at, version, notes) "
-                "VALUES (?, ?, ?)",
-                (applied_at, SCHEMA_VERSION, "initial schema v1"),
-            )
+            # Add missing columns to existing tables (migration-safe: no-op if already present)
+            for col_def in [
+                "ALTER TABLE facts ADD COLUMN hrr_vector BLOB",
+                "ALTER TABLE facts ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'",
+                "ALTER TABLE facts ADD COLUMN supersedes_fact_id TEXT",
+            ]:
+                try:
+                    conn.execute(col_def)
+                except Exception:
+                    pass  # column already exists — ignore
+
+            # Update version row if already had schema_version
+            if already_current:
+                applied_at = datetime.now(timezone.utc).isoformat()
+                conn.execute(
+                    "UPDATE schema_version SET version=?, notes=? WHERE version=?",
+                    (SCHEMA_VERSION, "migrated to v2 (hrr_vector, tags_json, supersedes_fact_id)", 1),
+                )
+            else:
+                # Insert schema version row
+                applied_at = datetime.now(timezone.utc).isoformat()
+                conn.execute(
+                    "INSERT INTO schema_version (applied_at, version, notes) "
+                    "VALUES (?, ?, ?)",
+                    (applied_at, SCHEMA_VERSION, "initial schema v2"),
+                )
             conn.commit()  # required — WAL mode doesn't auto-commit
         except Exception:
             conn.rollback()

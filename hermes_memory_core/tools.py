@@ -494,8 +494,9 @@ def _handle_memory_dream_now(args: Dict[str, Any], **kwargs) -> Dict[str, Any]:
 
     scope = args.get("scope", "since_last")
     session_id = args.get("session_id")
+    memory_db = kwargs.get("memory_db")
 
-    worker = DreamWorker()
+    worker = DreamWorker(store=memory_db)
     started_at = datetime.now(timezone.utc).isoformat()
     try:
         result = worker.dream(scope=scope, session_id=session_id)

@@ -1,351 +1,468 @@
-"""memory_write tool for Hermes Local Memory.
+"""
+Hermes Local Memory — tool schemas and handlers.
 
-Implements the Phase 4 canonical write path for facts/decisions/open_questions.
+Implements the 7 tool interfaces defined in TDD §5.2:
+  memory_query, memory_write, memory_update, memory_get_source,
+  memory_recent_context, memory_dream_now, fact_feedback
 """
 
-from __future__ import annotations
+from typing import Any
 
-import json
-from typing import Any, Dict, List, Optional
+# ── Tool Schemas ─────────────────────────────────────────────────────────────
 
-from hermes_memory_core import write_memory, update_memory, fact_feedback, MemoryWriteInput
-
-__all__ = ["memory_write_tool", "memory_update_tool", "fact_feedback_tool"]
+MEMORY_QUERY_SCHEMA = {
+    "name": "memory_query",
+    "description": (
+        "Search the local memory. Default mode 'hybrid' combines semantic + keyword + structural. "
+        "Modes also include 'semantic', 'keyword', 'facts', 'decisions', 'open_questions', "
+        "'sessions', 'daily', 'project', 'recent', 'probe', 'related', 'reason'."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query":   {"type": "string"},
+            "mode":    {"type": "string", "default": "hybrid"},
+            "project": {"type": "string"},
+            "entity":  {"type": "string"},
+            "entities": {"type": "array", "items": {"type": "string"}},
+            "filters": {"type": "object"},
+            "limit":   {"type": "integer", "default": 10},
+        },
+        "required": ["query"],
+    },
+}
 
 MEMORY_WRITE_SCHEMA = {
     "name": "memory_write",
     "description": (
         "Write a durable memory: fact / decision / open_question. "
-        "Source reference required. Redaction always runs unless force_no_redact=true."
+        "Source reference required."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "type": {
-                "type": "string",
-                "enum": ["fact", "decision", "open_question"],
-                "description": "Kind of memory to write.",
-            },
-            "text": {
-                "type": "string",
-                "description": "The memory text. Will be scanned for secrets before write.",
-            },
-            "project": {
-                "type": "string",
-                "description": "Optional project namespace.",
-            },
-            "scope": {
-                "type": "string",
-                "enum": ["user", "project", "general"],
-                "description": "Scope for facts (default: general).",
-            },
-            "source_ref": {
-                "type": "string",
-                "description": (
-                    "Reference to the source of this memory. "
-                    "Format: session:{id}#turn={id} or similar."
-                ),
-            },
-            "confidence": {
-                "type": "number",
-                "description": "Optional confidence score 0-1.",
-            },
-            "tags": {
-                "type": "string",
-                "description": "Comma-separated tags.",
-            },
-            "rationale": {
-                "type": "string",
-                "description": "Rationale for decisions.",
-            },
-            "owner": {
-                "type": "string",
-                "description": "Owner for decisions.",
-            },
-            "priority": {
-                "type": "string",
-                "description": "Priority for open questions (high/medium/low).",
-            },
-            "force_no_redact": {
-                "type": "boolean",
-                "default": False,
-                "description": "Skip redaction scan (logs override, use sparingly).",
-            },
+            "type":       {"type": "string", "enum": ["fact", "decision", "open_question"]},
+            "text":       {"type": "string"},
+            "project":    {"type": "string"},
+            "scope":      {"type": "string", "enum": ["user", "project", "general"]},
+            "source_ref": {"type": "string"},
+            "confidence": {"type": "number"},
+            "tags":       {"type": "string"},
+            "rationale":  {"type": "string"},
+            "owner":      {"type": "string"},
+            "priority":   {"type": "string"},
         },
-        "required": ["type", "text", "source_ref"],
+        "required": ["type", "text"],
     },
 }
-
-
-def memory_write_tool(
-    type: str,
-    text: str,
-    source_ref: str,
-    project: Optional[str] = None,
-    scope: Optional[str] = None,
-    confidence: Optional[float] = None,
-    tags: Optional[str] = None,
-    rationale: Optional[str] = None,
-    owner: Optional[str] = None,
-    priority: Optional[str] = None,
-) -> dict:
-    """Write a fact, decision, or open question to Hermes Local Memory.
-
-    Parameters
-    ----------
-    type : str
-        One of "fact", "decision", "open_question".
-    text : str
-        The memory text.
-    source_ref : str
-        Resolvable reference to the source content.
-    project : str, optional
-        Project namespace.
-    scope : str, optional
-        Scope for facts ("user", "project", "general").
-    confidence : float, optional
-        Confidence score 0-1.
-    tags : str, optional
-        Comma-separated tags string.
-    rationale : str, optional
-        Rationale (decisions only).
-    owner : str, optional
-        Owner (decisions only).
-    priority : str, optional
-        Priority (open_questions only).
-
-    Returns
-    -------
-    dict
-        write_memory result with written=True/False.
-    """
-    # Parse comma-separated tags into a list
-    tag_list: Optional[List[str]] = None
-    if tags:
-        tag_list = [t.strip() for t in tags.split(",") if t.strip()]
-
-    result = write_memory(
-        memory_type=type,
-        text=text,
-        source_ref=source_ref,
-        project=project,
-        scope=scope or "general",
-        confidence=confidence,
-        tags=tag_list,
-        rationale=rationale,
-        owner=owner,
-        priority=priority,
-    )
-
-    # Build human-readable summary
-    if result.get("written"):
-        record = result.get("record", {})
-        memory_id = record.get("fact_id") or record.get("decision_id") or record.get("question_id", "unknown")
-        types_redacted = result.get("types_redacted", [])
-        if types_redacted:
-            summary = f"[REDACTED: {', '.join(types_redacted)}] — written as {type}."
-        else:
-            summary = f"Written as {type} (ID: {memory_id[:20]}...)."
-    else:
-        summary = f"Blocked: {result.get('reason', 'unknown')}."
-
-    return {
-        "ok": result.get("written", False),
-        "summary": summary,
-        "memory_type": type,
-        "types_redacted": result.get("types_redacted", []),
-        "conflicts_checked": result.get("conflicts_checked", False),
-        "record": result.get("record", {}),
-    }
-
-
-# -------------------------------------------------------------------------------------
-# memory_update tool — Story 4.4.2
-# -------------------------------------------------------------------------------------
 
 MEMORY_UPDATE_SCHEMA = {
     "name": "memory_update",
-    "description": (
-        "Update an existing memory's content / trust / tags / status / category. "
-        "Only supplied fields are updated; omitted fields stay unchanged. "
-        "Trust (confidence) is stored for facts; decisions and open_questions store status/category/text."
-    ),
+    "description": "Update an existing memory's content / trust / tags / status / category.",
     "parameters": {
         "type": "object",
         "properties": {
-            "memory_id": {
-                "type": "string",
-                "description": "The memory ID to update (fact_*, decision_*, or question_*).",
-            },
-            "memory_type": {
-                "type": "string",
-                "enum": ["fact", "decision", "open_question"],
-                "description": "The kind of memory being updated.",
-            },
-            "text": {
-                "type": "string",
-                "description": "New memory text (content replacement).",
-            },
-            "trust_delta": {
-                "type": "number",
-                "description": (
-                    "Change to apply to confidence/trust score. "
-                    "For facts: applied as absolute value to confidence column (0.0-1.0)."
-                ),
-            },
-            "tags": {
-                "type": "string",
-                "description": "Comma-separated tags to set.",
-            },
-            "status": {
-                "type": "string",
-                "enum": ["active", "superseded", "disputed", "archived"],
-                "description": "New status for the memory.",
-            },
-            "category": {
-                "type": "string",
-                "description": "Category label for the memory.",
-            },
+            "memory_id":   {"type": "string"},
+            "text":        {"type": "string"},
+            "trust_delta": {"type": "number"},
+            "tags":        {"type": "string"},
+            "status":      {"type": "string", "enum": ["active", "superseded", "disputed", "archived"]},
+            "category":    {"type": "string"},
         },
-        "required": ["memory_id", "memory_type"],
+        "required": ["memory_id"],
     },
 }
 
+MEMORY_GET_SOURCE_SCHEMA = {
+    "name": "memory_get_source",
+    "description": "Resolve a source_ref back to original content + excerpt.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "source_ref": {"type": "string"},
+            "expand":     {"type": "boolean", "default": False},
+        },
+        "required": ["source_ref"],
+    },
+}
 
-def memory_update_tool(
-    memory_id: str,
-    memory_type: str,
-    text: Optional[str] = None,
-    trust_delta: Optional[float] = None,
-    tags: Optional[str] = None,
-    status: Optional[str] = None,
-    category: Optional[str] = None,
-) -> dict:
-    """Update an existing memory item (fact / decision / open_question).
-
-    Parameters
-    ----------
-    memory_id : str
-        The memory ID to update (fact_*, decision_*, or question_*).
-    memory_type : str
-        One of "fact", "decision", "open_question".
-    text : str, optional
-        New memory text.
-    trust_delta : float, optional
-        Change to apply to confidence/trust score.
-    tags : str, optional
-        Comma-separated tags string.
-    status : str, optional
-        One of "active", "superseded", "disputed", "archived".
-    category : str, optional
-        Category label.
-
-    Returns
-    -------
-    dict
-        update_memory result with updated=True/False.
-    """
-    tag_list: Optional[List[str]] = None
-    if tags:
-        tag_list = [t.strip() for t in tags.split(",") if t.strip()]
-
-    result = update_memory(
-        memory_id=memory_id,
-        memory_type=memory_type,
-        text=text,
-        trust_delta=trust_delta,
-        tags=tag_list,
-        status=status,
-        category=category,
-    )
-
-    if result.get("updated"):
-        changes = result.get("changes", {})
-        summary = f"Updated {memory_type} {memory_id[:20]}... — changed: {', '.join(changes.keys()) or 'none'}."
-    else:
-        summary = f"Update failed: {result.get('reason', 'unknown')}."
-
-    return {
-        "ok": result.get("updated", False),
-        "summary": summary,
-        "memory_type": memory_type,
-        "id": result.get("id"),
-        "changes": result.get("changes", {}),
-        "reason": result.get("reason"),
-    }
-
-
-# -------------------------------------------------------------------------------------
-# fact_feedback tool — Story 4.4.2 (ported from holographic semantics)
-# -------------------------------------------------------------------------------------
-
-FACT_FEEDBACK_SCHEMA = {
-    "name": "fact_feedback",
+MEMORY_RECENT_CONTEXT_SCHEMA = {
+    "name": "memory_recent_context",
     "description": (
-        "Rate a memory after using it. "
-        "helpful = confidence += 0.05 (clamped to [0, 1]); "
-        "unhelpful = confidence -= 0.10 (clamped to [0, 1])."
+        "Compact working set for session start: pinned facts + active project facts + "
+        "recent decisions + open questions, token-budget aware."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "memory_id": {
+            "project":   {"type": "string"},
+            "max_chars": {"type": "integer", "default": 4000},
+        },
+    },
+}
+
+MEMORY_DREAM_NOW_SCHEMA = {
+    "name": "memory_dream_now",
+    "description": (
+        "Trigger an immediate dream run. Default scope 'since_last' processes turns since last "
+        "checkpoint. Use 'today' for all turns today, 'date' with a date param for a specific "
+        "date, 'project' for a specific project, or 'weekly' for the last 7 days."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "scope":   {
                 "type": "string",
-                "description": "The fact ID to rate.",
+                "default": "since_last",
+                "enum": ["since_last", "today", "date", "project", "weekly"],
             },
-            "action": {
-                "type": "string",
-                "enum": ["helpful", "unhelpful"],
-                "description": "Feedback action: helpful (+0.05 trust) or unhelpful (-0.10 trust).",
-            },
+            "date":    {"type": "string"},
+            "project": {"type": "string"},
+            "deep":    {"type": "boolean", "default": False},
+            "memory_db": {"type": "string", "description": "Path to alternate memory SQLite DB (for testing)."},
+        },
+    },
+}
+
+FACT_FEEDBACK_SCHEMA = {
+    "name": "fact_feedback",
+    "description": "Rate a memory after using it. helpful=+0.05 trust, unhelpful=-0.10 trust.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "memory_id": {"type": "string"},
+            "action":    {"type": "string", "enum": ["helpful", "unhelpful"]},
         },
         "required": ["memory_id", "action"],
     },
 }
 
 
-def fact_feedback_tool(
-    memory_id: str,
-    action: str,
-) -> dict:
-    """Apply feedback to a fact, adjusting its confidence trust score.
+# ── Registry ─────────────────────────────────────────────────────────────────
 
-    Ported from holographic semantics:
-      - helpful  → confidence += 0.05, clamped to [0.0, 1.0]
-      - unhelpful → confidence -= 0.10, clamped to [0.0, 1.0]
+ALL_SCHEMAS = [
+    MEMORY_QUERY_SCHEMA,
+    MEMORY_WRITE_SCHEMA,
+    MEMORY_UPDATE_SCHEMA,
+    MEMORY_GET_SOURCE_SCHEMA,
+    MEMORY_RECENT_CONTEXT_SCHEMA,
+    MEMORY_DREAM_NOW_SCHEMA,
+    FACT_FEEDBACK_SCHEMA,
+]
 
-    Parameters
-    ----------
-    memory_id : str
-        The fact ID to rate.
-    action : str
-        Either "helpful" or "unhelpful".
 
-    Returns
-    -------
-    dict
-        fact_feedback result with ok=True/False and confidence values.
-    """
-    result = fact_feedback(memory_id=memory_id, action=action)
+def get_hermes_local_tool_schemas() -> list[dict[str, Any]]:
+    """Return all 7 tool schemas for registration with the Hermes agent."""
+    return ALL_SCHEMAS
 
-    if result.get("ok"):
-        old = result.get("old_confidence")
-        new = result.get("new_confidence")
-        delta = 0.05 if action == "helpful" else -0.10
-        summary = (
-            f"Feedback applied to {memory_id[:20]}...: "
-            f"{action} (delta={delta:+.2f}), "
-            f"confidence {old:.2f} → {new:.2f}."
-        )
-    else:
-        summary = f"Feedback failed: {result.get('reason', 'unknown')}."
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _parse_tags(tags_str: str | None) -> list[str] | None:
+    """Parse comma-separated tags string into a list of tag strings."""
+    if tags_str is None:
+        return None
+    result = [t.strip() for t in tags_str.split(",") if t.strip()]
+    return result if result else None
+
+
+def _tags_as_json(tags: list[str] | None) -> str | None:
+    """Convert a list of tags to a JSON string for DB storage."""
+    if tags is None:
+        return None
+    import json
+    return json.dumps(tags)
+
+
+def _format_fact(row: dict) -> dict:
+    return {
+        "id":         row.get("fact_id"),
+        "content":   row.get("fact_text"),
+        "project":    row.get("project"),
+        "entity":     row.get("entity"),
+        "category":   row.get("category"),
+        "trust":      row.get("trust_score"),
+        "status":     row.get("status"),
+        "tags":       row.get("tags_json"),
+        "source_refs": row.get("source_refs_json"),
+    }
+
+
+def _format_decision(row: dict) -> dict:
+    return {
+        "id":         row.get("decision_id"),
+        "content":   row.get("decision_text"),
+        "project":    row.get("project"),
+        "owner":      row.get("owner"),
+        "status":     row.get("status"),
+        "source_refs": row.get("source_refs_json"),
+    }
+
+
+def _format_question(row: dict) -> dict:
+    return {
+        "id":          row.get("question_id"),
+        "content":     row.get("question_text"),
+        "project":     row.get("project"),
+        "priority":    row.get("priority"),
+        "status":      row.get("status"),
+        "source_refs": row.get("source_refs_json"),
+    }
+
+
+def _format_session(row: dict) -> dict:
+    return {
+        "id":         row.get("session_id"),
+        "project":    row.get("project"),
+        "title":      row.get("title"),
+        "started_at": row.get("started_at"),
+        "ended_at":   row.get("ended_at"),
+    }
+
+
+# ── Tool Handlers ─────────────────────────────────────────────────────────────
+
+def _handle_memory_dream_now(params: dict[str, Any]) -> dict[str, Any]:
+    """Trigger a dream run and return the report path + summary."""
+    from hermes_memory_core.dream import DreamWorker
+
+    worker = DreamWorker()
+    memory_db = params.get("memory_db")
+    if memory_db:
+        from hermes_memory_core.store.sqlite import MemoryStore
+        worker = DreamWorker(store=MemoryStore(db_path=memory_db))
+    scope = params.get("scope", "since_last")
+    date = params.get("date")
+    project = params.get("project")
+    deep = params.get("deep", False)
+
+    report_path = worker.run(scope=scope, date=date, project=project, deep=deep)
 
     return {
-        "ok": result.get("ok", False),
-        "summary": summary,
-        "id": result.get("id"),
-        "old_confidence": result.get("old_confidence"),
-        "new_confidence": result.get("new_confidence"),
-        "action": result.get("action"),
-        "reason": result.get("reason"),
+        "status":     "ok",
+        "report_path": report_path,
+        "scope":      scope,
+        "message":    f"Dream run complete. Report: {report_path}",
     }
+
+
+def _handle_memory_query(params: dict[str, Any]) -> dict[str, Any]:
+    """Keyword / mode-based search over facts, decisions, and open questions."""
+    from hermes_memory_core.store import get_memory_store
+
+    store = get_memory_store()
+    query  = params.get("query", "")
+    mode   = params.get("mode", "hybrid")
+    project = params.get("project")
+    entity  = params.get("entity")
+    limit  = params.get("limit", 10)
+
+    if mode == "facts":
+        rows = store.get_facts(project=project, entity=entity, limit=limit)
+        return {"mode": "facts", "results": [_format_fact(r) for r in rows]}
+
+    if mode == "decisions":
+        rows = store.get_decisions(project=project, limit=limit)
+        return {"mode": "decisions", "results": [_format_decision(r) for r in rows]}
+
+    if mode == "open_questions":
+        rows = store.get_open_questions(project=project, limit=limit)
+        return {"mode": "open_questions", "results": [_format_question(r) for r in rows]}
+
+    if mode == "sessions":
+        rows = store.get_recent_sessions(limit=limit)
+        return {"mode": "sessions", "results": [_format_session(r) for r in rows]}
+
+    # Keyword fallback — simple substring scan
+    if mode in ("keyword", "hybrid"):
+        facts     = store.get_facts(project=project, entity=entity, limit=limit * 2)
+        decisions = store.get_decisions(project=project, limit=limit)
+        q_lower   = query.lower()
+        matched_facts = [_format_fact(r) for r in facts
+                         if q_lower in (r.get("fact_text") or "").lower()]
+        matched_decisions = [_format_decision(r) for r in decisions
+                             if q_lower in (r.get("decision_text") or "").lower()]
+        combined = matched_facts + matched_decisions
+        return {"mode": mode, "results": combined[:limit]}
+
+    # Default fallback
+    rows = store.get_facts(project=project, limit=limit)
+    return {"mode": mode, "results": [_format_fact(r) for r in rows]}
+
+
+def _handle_memory_write(params: dict[str, Any]) -> dict[str, Any]:
+    """Write a fact, decision, or open_question through the canonical pipeline."""
+    from hermes_memory_core.write.pipeline import write_memory
+    from hermes_memory_core.write.redaction import redact
+
+    text = params.get("text", "")
+    # Redact before storing
+    redacted: "RedactionResult" = redact(text)
+    tags = _parse_tags(params.get("tags"))
+    if tags is not None:
+        import json
+        tags = json.dumps(tags)  # write_memory expects List[str], redact expects plain text
+
+    result = write_memory(
+        memory_type  = params.get("type", "fact"),
+        text         = redacted.redacted_text,
+        scope        = params.get("scope", "general"),
+        project      = params.get("project"),
+        source_ref   = params.get("source_ref", "manual"),
+        confidence   = params.get("confidence"),
+        tags         = tags,
+        rationale    = params.get("rationale"),
+        owner        = params.get("owner"),
+        priority     = params.get("priority"),
+    )
+
+    return {
+        "status":     "ok",
+        "id":         result.get("id"),
+        "type":       params.get("type"),
+        "text":       redacted.redacted_text,
+        "redacted":   redacted.redacted,
+        "message":    f"Written: {params.get('type')} — {redacted.redacted_text[:80]}",
+    }
+
+
+def _handle_memory_update(params: dict[str, Any]) -> dict[str, Any]:
+    """Update an existing memory entry."""
+    from hermes_memory_core.store import get_memory_store
+    from hermes_memory_core.write.redaction import redact
+
+    store = get_memory_store()
+    memory_id = params.get("memory_id")
+
+    content = params.get("text")
+    if content:
+        content = redact(content).redacted_text
+
+    tags_str = _parse_tags(params.get("tags"))  # comma-joined string for DB
+
+    store.update_memory(
+        memory_id,
+        content     = content,
+        trust_delta = params.get("trust_delta"),
+        tags        = tags_str,
+        status      = params.get("status"),
+        category    = params.get("category"),
+    )
+
+    return {"status": "ok", "memory_id": memory_id}
+
+
+def _handle_memory_get_source(params: dict[str, Any]) -> dict[str, Any]:
+    """Resolve a source_ref to the original turn or dream run."""
+    from hermes_memory_core.store import get_memory_store
+
+    store = get_memory_store()
+    source_ref = params.get("source_ref", "")
+
+    if source_ref.startswith("turn:"):
+        turn_id = source_ref.split(":", 1)[1]
+        turn = store.get_turn(turn_id)
+        if turn:
+            return {
+                "source_ref": source_ref,
+                "type":       "turn",
+                "content":    turn.get("content"),
+                "role":       turn.get("role"),
+                "project":    turn.get("project"),
+            }
+
+    if source_ref.startswith("dream:"):
+        run_id = source_ref.split(":", 1)[1]
+        run = store.get_dream_run(run_id)
+        if run:
+            return {
+                "source_ref":   source_ref,
+                "type":         "dream_run",
+                "report_path":  run.get("output_path"),
+                "scope":        run.get("input_scope_json"),
+                "status":       run.get("status"),
+            }
+
+    return {"source_ref": source_ref, "error": "not found"}
+
+
+def _handle_memory_recent_context(params: dict[str, Any]) -> dict[str, Any]:
+    """Build a compact recent-context summary for session start."""
+    from hermes_memory_core.store import get_memory_store
+
+    store = get_memory_store()
+    project  = params.get("project")
+    max_chars = params.get("max_chars", 4000)
+
+    facts     = store.get_facts(project=project, limit=20)
+    decisions  = store.get_decisions(project=project, limit=10)
+    questions  = store.get_open_questions(project=project, limit=10)
+
+    lines = []
+    if facts:
+        lines.append("## Facts")
+        for f in facts[:10]:
+            lines.append(f"- {f.get('fact_text', '')}")
+    if decisions:
+        lines.append("## Decisions")
+        for d in decisions[:5]:
+            lines.append(f"- {d.get('decision_text', '')}")
+    if questions:
+        lines.append("## Open Questions")
+        for q in questions[:5]:
+            lines.append(f"- {q.get('question_text', '')}")
+
+    context = "\n".join(lines)
+    if len(context) > max_chars:
+        context = context[:max_chars] + "\n[truncated]"
+
+    return {"context": context, "chars": len(context)}
+
+
+def _handle_fact_feedback(params: dict[str, Any]) -> dict[str, Any]:
+    """Rate a memory entry and adjust its trust score."""
+    from hermes_memory_core.store import get_memory_store
+
+    store = get_memory_store()
+    memory_id = params.get("memory_id")
+    action = params.get("action")
+
+    delta = 0.05 if action == "helpful" else -0.10
+    store.update_memory(memory_id, trust_delta=delta)
+
+    return {
+        "status":    "ok",
+        "memory_id": memory_id,
+        "action":    action,
+        "trust_delta": delta,
+    }
+
+
+# ── Dispatcher ────────────────────────────────────────────────────────────────
+
+_TOOL_HANDLERS = {
+    "memory_query":           _handle_memory_query,
+    "memory_write":          _handle_memory_write,
+    "memory_update":         _handle_memory_update,
+    "memory_get_source":     _handle_memory_get_source,
+    "memory_recent_context": _handle_memory_recent_context,
+    "memory_dream_now":      _handle_memory_dream_now,
+    "fact_feedback":         _handle_fact_feedback,
+}
+
+
+def handle_hermes_local_tool_call(
+    tool_name: str,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Dispatch a tool call to the appropriate handler.
+    Returns a dict result; the gateway serialises it as the tool response.
+    """
+    handler = _TOOL_HANDLERS.get(tool_name)
+    if handler is None:
+        return {"error": f"Unknown tool: {tool_name}"}
+    try:
+        return handler(params)
+    except Exception as exc:
+        return {"error": f"{tool_name} failed: {exc}", "detail": str(exc)}

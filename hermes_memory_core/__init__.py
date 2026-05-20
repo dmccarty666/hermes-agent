@@ -406,13 +406,11 @@ _singleton_db: Optional[MemoryDB] = None
 # Re-export from write.pipeline so callers can use a single import
 # ---------------------------------------------------------------------------
 
-from hermes_memory_core.write.pipeline import write_memory, update_memory, fact_feedback, MemoryWriteInput
+from hermes_memory_core.write.pipeline import write_memory, write_audit_log
 
 __all__ = [
     "MemoryDB",
     "get_memory_db",
     "write_memory",
-    "update_memory",
-    "fact_feedback",
-    "MemoryWriteInput",
+    "write_audit_log",
 ]

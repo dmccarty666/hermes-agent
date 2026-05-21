@@ -12478,6 +12478,31 @@ Examples:
         default="all",
         help="Which store to reset: 'all' (default), 'memory', or 'user'",
     )
+    _backup_parser = memory_sub.add_parser(
+        "backup",
+        help="Create a timestamped backup of hermes-local memory",
+    )
+    _backup_parser.add_argument(
+        "--memory-dir",
+        default=None,
+        help="Override memory root directory",
+    )
+    _backup_parser.add_argument(
+        "--backup-dir",
+        default=None,
+        help="Override backup output directory",
+    )
+    _backup_parser.add_argument(
+        "--list",
+        action="store_true",
+        help="List existing backups",
+    )
+    _backup_parser.add_argument(
+        "--verify",
+        default=None,
+        metavar="ARCHIVE",
+        help="Verify an archive against its manifest",
+    )
 
     def cmd_memory(args):
         sub = getattr(args, "memory_command", None)
@@ -12536,6 +12561,9 @@ Examples:
                 f"\n  Memory reset complete. New sessions will start with a blank slate."
             )
             print(f"  Files were in: {display_hermes_home()}/memories/\n")
+        elif sub == "backup":
+            from hermes_memory_core.store.backup import cmd_memory_backup
+            sys.exit(cmd_memory_backup(args))
         else:
             from hermes_cli.memory_setup import memory_command
 

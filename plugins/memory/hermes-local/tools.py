@@ -13,15 +13,16 @@ from typing import Any
 MEMORY_QUERY_SCHEMA = {
     "name": "memory_query",
     "description": (
-        "Search the local memory. Default mode 'hybrid' combines semantic + keyword + structural. "
-        "Modes also include 'semantic', 'keyword', 'facts', 'decisions', 'open_questions', "
-        "'sessions', 'daily', 'project', 'recent', 'probe', 'related', 'reason'."
+        "Search the local memory. Default mode 'semantic' uses embeddings for conceptual match. "
+        "Other modes: 'keyword', 'facts', 'decisions', 'open_questions', "
+        "'sessions', 'daily', 'project', 'recent', 'probe', 'related', 'reason', 'hybrid' (combines all — "
+        "currently degraded, falls back to semantic)."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "query":   {"type": "string"},
-            "mode":    {"type": "string", "default": "hybrid"},
+            "mode":    {"type": "string", "default": "semantic"},
             "project": {"type": "string"},
             "entity":  {"type": "string"},
             "entities": {"type": "array", "items": {"type": "string"}},
@@ -188,6 +189,26 @@ def _format_fact(row: dict) -> dict:
     }
 
 
+def _format_hybrid_hit(hit: Any) -> dict:
+    """Best-effort flatten of whatever hermes_memory_core.search.hybrid returns.
+
+    The hybrid module may return dicts with varying shapes (chunk hits, fact
+    hits, summary hits). We surface the common fields the model needs to
+    ground a response: text content, where it came from, and a score.
+    """
+    if not isinstance(hit, dict):
+        return {"content": str(hit)}
+    return {
+        "content":     hit.get("text") or hit.get("content") or hit.get("fact_text") or "",
+        "source":      hit.get("source") or hit.get("source_ref") or hit.get("source_refs_json"),
+        "score":       hit.get("score") or hit.get("rank"),
+        "kind":        hit.get("kind") or hit.get("type"),
+        "id":          hit.get("id") or hit.get("fact_id") or hit.get("chunk_id"),
+        "project":     hit.get("project"),
+        "entity":      hit.get("entity"),
+    }
+
+
 def _format_decision(row: dict) -> dict:
     return {
         "id":         row.get("decision_id"),
@@ -252,7 +273,7 @@ def _handle_memory_query(params: dict[str, Any]) -> dict[str, Any]:
 
     store = get_memory_store()
     query  = params.get("query", "")
-    mode   = params.get("mode", "hybrid")
+    mode   = params.get("mode", "semantic")
     project = params.get("project")
     entity  = params.get("entity")
     limit  = params.get("limit", 10)
@@ -273,8 +294,52 @@ def _handle_memory_query(params: dict[str, Any]) -> dict[str, Any]:
         rows = store.get_recent_sessions(limit=limit)
         return {"mode": "sessions", "results": [_format_session(r) for r in rows]}
 
-    # Keyword fallback — simple substring scan
-    if mode in ("keyword", "hybrid"):
+    # Semantic / hybrid — real embedding-based search via the hybrid module.
+    # If hybrid returns empty (no Qdrant points yet, or merge-logic bug), fall
+    # back to facts so the model still gets something relevant to ground its
+    # response.
+    if mode in ("semantic", "hybrid"):
+        try:
+            from hermes_memory_core.search import hybrid as _hybrid
+            raw = _hybrid.search(query, mode=mode, limit=limit, memory_db=store)
+            # hybrid.search returns dict {"results": [...], "count": N, ...}
+            hits = raw.get("results") if isinstance(raw, dict) else raw
+            if hits:
+                return {
+                    "mode": mode,
+                    "results": [_format_hybrid_hit(h) for h in hits],
+                    "backend_weights": raw.get("backend_weights") if isinstance(raw, dict) else None,
+                }
+            # No hits from semantic/hybrid (likely Qdrant empty pre-indexing).
+            # Fall back to keyword substring scan on facts — scan generously
+            # (up to 200 facts) so we don't miss matches due to a low limit.
+            facts = store.get_facts(project=project, entity=entity, limit=max(200, limit * 10))
+            q_lower = query.lower()
+            kw_matched = [_format_fact(r) for r in facts
+                          if q_lower in (r.get("fact_text") or "").lower()]
+            if kw_matched:
+                return {
+                    "mode": mode,
+                    "fallback": "keyword",
+                    "note": f"{mode} returned 0 hits (Qdrant points=0?); keyword substring matched {len(kw_matched)}",
+                    "results": kw_matched[:limit],
+                }
+            return {
+                "mode": mode,
+                "fallback": "none",
+                "note": f"{mode} returned 0 hits; keyword found nothing — query likely unrelated to stored memory",
+                "results": [],
+            }
+        except Exception as e:
+            # Last-resort: keyword substring scan
+            facts = store.get_facts(project=project, entity=entity, limit=limit * 2)
+            q_lower = query.lower()
+            matched = [_format_fact(r) for r in facts
+                       if q_lower in (r.get("fact_text") or "").lower()]
+            return {"mode": mode, "fallback": "keyword", "error": str(e), "results": matched[:limit]}
+
+    # Keyword — simple substring scan over facts + decisions
+    if mode == "keyword":
         facts     = store.get_facts(project=project, entity=entity, limit=limit * 2)
         decisions = store.get_decisions(project=project, limit=limit)
         q_lower   = query.lower()
@@ -285,9 +350,9 @@ def _handle_memory_query(params: dict[str, Any]) -> dict[str, Any]:
         combined = matched_facts + matched_decisions
         return {"mode": mode, "results": combined[:limit]}
 
-    # Default fallback
+    # Unknown mode — return recent facts as a safe default
     rows = store.get_facts(project=project, limit=limit)
-    return {"mode": mode, "results": [_format_fact(r) for r in rows]}
+    return {"mode": mode, "fallback": "facts", "results": [_format_fact(r) for r in rows]}
 
 
 def _handle_memory_write(params: dict[str, Any]) -> dict[str, Any]:

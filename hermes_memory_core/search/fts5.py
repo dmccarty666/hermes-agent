@@ -166,7 +166,11 @@ def fts5_search(
         return [_row_to_dict(row, table, join_cols, content_col) for row in rows]
 
     except sqlite3.OperationalError as exc:
-        logger.warning("fts5_search: query failed -- %s", exc)
+        # Include the table name to disambiguate schema/migration errors
+        # ("no such column …") from genuine FTS5 MATCH failures.
+        logger.warning(
+            "fts5_search: query failed on table=%s -- %s", table, exc,
+        )
         return []
     finally:
         if conn is not None:

@@ -872,6 +872,24 @@ _FULL_SCHEMA_MEMORY_DB = "\n".join([
     "CREATE TABLE IF NOT EXISTS schema_version (applied_at TEXT NOT NULL, version INTEGER NOT NULL PRIMARY KEY, notes TEXT);",
     "CREATE TABLE IF NOT EXISTS audit_log (audit_id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, target_kind TEXT, target_id TEXT, detail_json TEXT, source_ref TEXT);",
     "CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);",
+    # FTS5 virtual tables (content-less, synced from base tables via triggers).
+    "CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(content, content=turns, content_rowid=rowid, tokenize='porter unicode61');",
+    "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(chunk_text, content=chunks, content_rowid=rowid, tokenize='porter unicode61');",
+    "CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(fact_text, content=facts, content_rowid=rowid, tokenize='porter unicode61');",
+    "CREATE VIRTUAL TABLE IF NOT EXISTS decisions_fts USING fts5(decision_text, content=decisions, content_rowid=rowid, tokenize='porter unicode61');",
+    # FTS sync triggers — keep FTS in lockstep with base tables.
+    "CREATE TRIGGER IF NOT EXISTS turns_fts_ai AFTER INSERT ON turns BEGIN INSERT INTO turns_fts(rowid, content) VALUES (NEW.rowid, NEW.content); END;",
+    "CREATE TRIGGER IF NOT EXISTS turns_fts_ad AFTER DELETE ON turns BEGIN INSERT INTO turns_fts(turns_fts, rowid, content) VALUES('delete', OLD.rowid, OLD.content); END;",
+    "CREATE TRIGGER IF NOT EXISTS turns_fts_au AFTER UPDATE ON turns BEGIN INSERT INTO turns_fts(turns_fts, rowid, content) VALUES('delete', OLD.rowid, OLD.content); INSERT INTO turns_fts(rowid, content) VALUES (NEW.rowid, NEW.content); END;",
+    "CREATE TRIGGER IF NOT EXISTS chunks_fts_ai AFTER INSERT ON chunks BEGIN INSERT INTO chunks_fts(rowid, chunk_text) VALUES (NEW.rowid, NEW.chunk_text); END;",
+    "CREATE TRIGGER IF NOT EXISTS chunks_fts_ad AFTER DELETE ON chunks BEGIN INSERT INTO chunks_fts(chunks_fts, rowid, chunk_text) VALUES('delete', OLD.rowid, OLD.chunk_text); END;",
+    "CREATE TRIGGER IF NOT EXISTS chunks_fts_au AFTER UPDATE ON chunks BEGIN INSERT INTO chunks_fts(chunks_fts, rowid, chunk_text) VALUES('delete', OLD.rowid, OLD.chunk_text); INSERT INTO chunks_fts(rowid, chunk_text) VALUES (NEW.rowid, NEW.chunk_text); END;",
+    "CREATE TRIGGER IF NOT EXISTS facts_fts_ai AFTER INSERT ON facts BEGIN INSERT INTO facts_fts(rowid, fact_text) VALUES (NEW.rowid, NEW.fact_text); END;",
+    "CREATE TRIGGER IF NOT EXISTS facts_fts_ad AFTER DELETE ON facts BEGIN INSERT INTO facts_fts(facts_fts, rowid, fact_text) VALUES('delete', OLD.rowid, OLD.fact_text); END;",
+    "CREATE TRIGGER IF NOT EXISTS facts_fts_au AFTER UPDATE ON facts BEGIN INSERT INTO facts_fts(facts_fts, rowid, fact_text) VALUES('delete', OLD.rowid, OLD.fact_text); INSERT INTO facts_fts(rowid, fact_text) VALUES (NEW.rowid, NEW.fact_text); END;",
+    "CREATE TRIGGER IF NOT EXISTS decisions_fts_ai AFTER INSERT ON decisions BEGIN INSERT INTO decisions_fts(rowid, decision_text) VALUES (NEW.rowid, NEW.decision_text); END;",
+    "CREATE TRIGGER IF NOT EXISTS decisions_fts_ad AFTER DELETE ON decisions BEGIN INSERT INTO decisions_fts(decisions_fts, rowid, decision_text) VALUES('delete', OLD.rowid, OLD.decision_text); END;",
+    "CREATE TRIGGER IF NOT EXISTS decisions_fts_au AFTER UPDATE ON decisions BEGIN INSERT INTO decisions_fts(decisions_fts, rowid, decision_text) VALUES('delete', OLD.rowid, OLD.decision_text); INSERT INTO decisions_fts(rowid, decision_text) VALUES (NEW.rowid, NEW.decision_text); END;",
 ])
 
 
@@ -902,6 +920,22 @@ class MemoryDB(MemoryStore):
             conn.execute("PRAGMA foreign_keys = ON")
             conn.execute("PRAGMA temp_store = MEMORY")
             conn.execute("PRAGMA mmap_size = 268435456")
+            # Pre-schema migrations: add columns to pre-existing tables that
+            # lack them, so the CREATE INDEX statements in _FULL_SCHEMA_MEMORY_DB
+            # don't raise "no such column" on legacy DBs. These ALTERs are
+            # idempotent — sqlite raises OperationalError when the column
+            # already exists (or the table doesn't yet), which we swallow.
+            _pre_schema_migrations = (
+                "ALTER TABLE entities ADD COLUMN project TEXT",
+                "ALTER TABLE entities ADD COLUMN alias_json TEXT",
+                "ALTER TABLE entities ADD COLUMN updated_at TEXT",
+                "ALTER TABLE facts ADD COLUMN trust_score REAL DEFAULT 0.5",
+            )
+            for stmt in _pre_schema_migrations:
+                try:
+                    conn.execute(stmt)
+                except sqlite3.OperationalError:
+                    pass  # column already exists or table not yet created
             conn.executescript(_FULL_SCHEMA_MEMORY_DB)
             self._conn = conn
             self._initialized = True

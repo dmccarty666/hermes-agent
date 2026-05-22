@@ -28,6 +28,11 @@ MEMORY_QUERY_SCHEMA = {
             "entities": {"type": "array", "items": {"type": "string"}},
             "filters": {"type": "object"},
             "limit":   {"type": "integer", "default": 10},
+            "min_score": {
+                "type": "number",
+                "default": 0.30,
+                "description": "Minimum cosine similarity score for hybrid/semantic results to be included",
+            },
         },
         "required": ["query"],
     },
@@ -272,11 +277,12 @@ def _handle_memory_query(params: dict[str, Any]) -> dict[str, Any]:
     from hermes_memory_core.store import get_memory_store
 
     store = get_memory_store()
-    query  = params.get("query", "")
-    mode   = params.get("mode", "hybrid")
+    query   = params.get("query", "")
+    mode    = params.get("mode", "hybrid")
     project = params.get("project")
     entity  = params.get("entity")
-    limit  = params.get("limit", 10)
+    limit   = params.get("limit", 10)
+    min_score = params.get("min_score", 0.30)
 
     if mode == "facts":
         rows = store.get_facts(project=project, entity=entity, limit=limit)
@@ -303,16 +309,39 @@ def _handle_memory_query(params: dict[str, Any]) -> dict[str, Any]:
             from hermes_memory_core.search import hybrid as _hybrid
             raw = _hybrid.search(query, mode=mode, limit=limit, memory_db=store)
             # hybrid.search returns dict {"results": [...], "count": N, ...}
-            hits = raw.get("results") if isinstance(raw, dict) else raw
-            if hits:
+            raw_hits = raw.get("results") if isinstance(raw, dict) else raw
+            raw_hits = raw_hits or []
+
+            # Filter out low-confidence vector noise (cosine similarity below
+            # min_score). Real hits are typically 0.40+; junk hits 0.20-.
+            def _score_of(h):
+                try:
+                    return float(h.get("score", 0.0)) if isinstance(h, dict) else 0.0
+                except (TypeError, ValueError):
+                    return 0.0
+
+            filtered_hits = [h for h in raw_hits if _score_of(h) >= min_score]
+
+            if filtered_hits:
                 return {
                     "mode": mode,
-                    "results": [_format_hybrid_hit(h) for h in hits],
+                    "results": [_format_hybrid_hit(h) for h in filtered_hits],
                     "backend_weights": raw.get("backend_weights") if isinstance(raw, dict) else None,
                 }
-            # No hits from semantic/hybrid (likely Qdrant empty pre-indexing).
-            # Fall back to keyword substring scan on facts — scan generously
-            # (up to 200 facts) so we don't miss matches due to a low limit.
+
+            # If we had raw hits but min_score filtered them all out, that's
+            # an "irrelevant query" signal — return empty with a clear note.
+            # Do NOT fall back to keyword scan in this case.
+            if raw_hits:
+                return {
+                    "mode": mode,
+                    "results": [],
+                    "note": f"no results above min_score={min_score:.2f} (lower threshold or rephrase query)",
+                }
+
+            # raw_hits was empty — Qdrant likely has no points yet. Fall back
+            # to keyword substring scan on facts so the model still gets
+            # something relevant to ground its response.
             facts = store.get_facts(project=project, entity=entity, limit=max(200, limit * 10))
             q_lower = query.lower()
             kw_matched = [_format_fact(r) for r in facts

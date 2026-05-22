@@ -41,9 +41,10 @@
     hudBar.style.width = (overall * 100).toFixed(2) + '%';
     if (pct >= 1 && playing) {
       next();
-    } else {
-      rafId = requestAnimationFrame(tickProgress);
     }
+    // ALWAYS reschedule the rAF — auto-advance must keep ticking on every
+    // subsequent frame, not stop after the first transition.
+    rafId = requestAnimationFrame(tickProgress);
   }
 
   // --- generate decorative stars for dreamer frame ---
@@ -385,14 +386,18 @@
     to = ((to % total) + total) % total;
     if (to === index) return;
     // crossfade
-    const out = frames[index];
+    const from = index;  // capture BEFORE reassign so the closure has the right value
+    const out = frames[from];
     const into = frames[to];
-    gsap.to(out, { opacity: 0, duration: 0.45, ease: 'power2.inOut', onComplete: () => exit(index) });
+    gsap.to(out, { opacity: 0, duration: 0.45, ease: 'power2.inOut', onComplete: () => exit(from) });
     gsap.fromTo(into,
       { opacity: 0 },
       { opacity: 1, duration: 0.45, ease: 'power2.inOut',
         onStart: () => { into.style.visibility = 'visible'; enter(to); } });
     index = to;
+    // Reset frame timer immediately so the rAF clock doesn't see a huge
+    // elapsed delta and re-fire next() on the very next tick.
+    frameStart = performance.now();
   }
 
   function next() { go(index + 1); }

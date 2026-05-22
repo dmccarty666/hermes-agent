@@ -4,8 +4,12 @@ After=network.target
 
 [Service]
 Type=oneshot
+User=dmccarty
+Group=dmccarty
+WorkingDirectory=/home/dmccarty/.hermes/hermes-agent
+Environment=HOME=/home/dmccarty
 Environment=PYTHONPATH=/home/dmccarty/.hermes/hermes-agent
+Environment=XDG_CACHE_HOME=/home/dmccarty/.cache
 ExecStart=/home/dmccarty/.hermes/hermes-agent/venv/bin/python -m hermes_memory_core.dream --scope since_last
 StandardOutput=journal
 StandardError=journal
-Environment=XDG_CACHE_HOME=/home/dmccarty/.cache

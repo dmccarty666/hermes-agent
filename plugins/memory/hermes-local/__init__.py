@@ -3,13 +3,16 @@
 Implements the MemoryProvider ABC. Registers when:
   memory.provider = hermes-local
 
-Provides tools:
-  - memory_write   (Epic 4.4.1)
-  - memory_query   (Epic 4.1.1)
-  - memory_update  (Epic 4.4.2)
-  - memory_recent_context (Epic 4.3.1)
+Provides tools (read-oriented schemas exposed to the model — write/update/feedback
+are kept internal so the model doesn't accidentally bypass the dreamer pipeline):
+  - memory_query           (Epic 4.1.1)
+  - memory_get_source      (Epic 4.1.2)
+  - memory_recent_context  (Epic 4.3.1)
+
+The full handler registry in tools.py also dispatches:
+  - memory_write           (Epic 4.4.1)
+  - memory_update          (Epic 4.4.2)
   - memory_dream_now
-  - memory_get_source
   - fact_feedback
 
 Hooks registered:
@@ -22,11 +25,76 @@ Hooks registered:
 
 from __future__ import annotations
 
+import importlib
 import logging
 import os
-from typing import Any, Callable, List, Optional
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
+
+from agent.memory_provider import MemoryProvider
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Helpers (sibling-module lookup — directory has a hyphen in its name)
+# ---------------------------------------------------------------------------
+
+# Plugin loader registers submodules under the hyphenated name, e.g.
+# "plugins.memory.hermes-local.tools". Python's "from x import y" can't
+# parse a hyphen, so we resolve siblings via sys.modules / importlib.
+
+_PLUGIN_PKG = "plugins.memory.hermes-local"
+
+
+def _sibling(modname: str):
+    """Return a loaded sibling submodule, importing it if needed."""
+    fq = f"{_PLUGIN_PKG}.{modname}"
+    mod = sys.modules.get(fq)
+    if mod is not None:
+        return mod
+    try:
+        return importlib.import_module(fq)
+    except Exception:
+        # Fall back to spec_from_file_location so this works even when the
+        # plugin is loaded outside the normal plugin discovery path.
+        here = Path(__file__).parent
+        sub_path = here / f"{modname}.py"
+        if not sub_path.exists():
+            raise
+        import importlib.util as _util
+        spec = _util.spec_from_file_location(fq, str(sub_path))
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot load {fq}")
+        loaded = _util.module_from_spec(spec)
+        sys.modules[fq] = loaded
+        spec.loader.exec_module(loaded)
+        return loaded
+
+
+def _hermes_home() -> Path:
+    """Active Hermes home — honors HERMES_HOME env var, falls back to ~/.hermes."""
+    val = os.environ.get("HERMES_HOME", "").strip()
+    if val:
+        return Path(val)
+    return Path(os.path.expanduser("~/.hermes"))
+
+
+def _read_provider_config_value() -> str:
+    """Read memory.provider from the active config.yaml. Empty string if missing."""
+    config_path = _hermes_home() / "config.yaml"
+    if not config_path.exists():
+        return ""
+    try:
+        import yaml
+        with open(config_path, encoding="utf-8-sig") as f:
+            cfg = yaml.safe_load(f) or {}
+        return (cfg.get("memory", {}) or {}).get("provider", "") or ""
+    except Exception:
+        return ""
+
 
 # ---------------------------------------------------------------------------
 # Plugin registration
@@ -35,125 +103,394 @@ logger = logging.getLogger(__name__)
 def register(ctx) -> "HermesLocalProvider":
     """Register the hermes-local memory provider.
 
-    Called by the plugin loader. Gating is done via config check below,
-    so this function always registers but the provider is only activated
-    when memory.provider=hermes-local.
+    Called by the plugin loader. Gating is done via config check in
+    is_available() so this function always returns a provider instance —
+    the agent activates it only when memory.provider == 'hermes-local'.
     """
     provider = HermesLocalProvider()
-    # Wire into Hermes plugin system via the standard contract
     if ctx is not None and hasattr(ctx, "register_memory_provider"):
         ctx.register_memory_provider(provider)
     logger.info("[hermes-local] Memory provider registered (activation gated on config).")
     return provider
 
 
-def is_available() -> bool:
-    """Return True when memory.provider is set to hermes-local in config."""
-    # Read from ~/.hermes/config.yaml via hermes_constants or direct YAML
-    try:
-        import yaml
-        config_path = os.path.expanduser("~/.hermes/config.yaml")
-        if os.path.exists(config_path):
-            with open(config_path) as f:
-                cfg = yaml.safe_load(f) or {}
-            provider = cfg.get("memory", {}).get("provider", "")
-            return provider == "hermes-local"
-    except Exception:
-        pass
-    # Also check env override
-    return os.environ.get("HERMES_MEMORY_PROVIDER") == "hermes-local"
-
-
 # ---------------------------------------------------------------------------
 # HermesLocalProvider
 # ---------------------------------------------------------------------------
 
-class HermesLocalProvider:
+class HermesLocalProvider(MemoryProvider):
     """Local-first memory provider for Hermes.
 
     Manages lossless turn capture, hybrid retrieval, and dream extraction.
     Lazily imports heavy modules to keep startup fast.
     """
 
-    name: str = "hermes-local"
-
     def __init__(self) -> None:
         self._hooks: List[tuple[str, Callable]] = []
         self._memory_db = None
+        self._session_id: str = ""
+        self._hermes_home: Path = _hermes_home()
+        self._turn_sequence: int = 0
         # Phase 5 (Epic 5.1.2): narrative thread injection
-        self._agent_ref: Optional[Any] = None  # AIAgent reference for conversation_history injection
-        self._nt_first_turn_done: bool = False  # prevent double-injection on same session
-        self._nt_prev_content: str = ""  # cached prior-session thread content
+        self._agent_ref: Optional[Any] = None
+        self._nt_first_turn_done: bool = False
+        self._nt_prev_content: str = ""
 
-    # ── Tool schemas ────────────────────────────────────────────────────────
+    # ── ABC: name ───────────────────────────────────────────────────────────
 
-    def get_tool_schemas(self) -> List[dict]:
-        """Return all tool schemas exposed by this provider."""
-        from plugins.memory.hermes_local.tools import (
-            MEMORY_WRITE_SCHEMA,
-            MEMORY_UPDATE_SCHEMA,
-            FACT_FEEDBACK_SCHEMA,
+    @property
+    def name(self) -> str:
+        return "hermes-local"
+
+    # ── ABC: is_available ───────────────────────────────────────────────────
+
+    def is_available(self) -> bool:
+        """True when memory.provider == 'hermes-local' AND SQLite schema is present.
+
+        Honors HERMES_HOME so tests can point at a temp config.yaml.
+        The schema check is a cheap sqlite_master lookup; if the DB file
+        is missing entirely we still report available since the schema
+        will be auto-created on first use.
+        """
+        provider = _read_provider_config_value()
+        if provider != "hermes-local":
+            # Env override is also accepted (test/dev convenience)
+            if os.environ.get("HERMES_MEMORY_PROVIDER") != "hermes-local":
+                return False
+
+        # Schema presence: only enforce when the DB file already exists.
+        # A missing DB is a fresh install — the store will lazily init it.
+        db_path = self._hermes_home / "memory" / "index" / "memory.sqlite"
+        if not db_path.exists():
+            return True
+        try:
+            import sqlite3
+            conn = sqlite3.connect(str(db_path))
+            try:
+                row = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='facts'"
+                ).fetchone()
+                return row is not None
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.debug("[hermes-local] is_available schema check failed: %s", e)
+            return False
+
+    # ── ABC: initialize ─────────────────────────────────────────────────────
+
+    def initialize(self, session_id: str, **kwargs) -> None:
+        """Initialize for a session.
+
+        kwargs may include hermes_home, platform, agent_context,
+        agent_identity, user_id, parent_session_id, agent_ref.
+        """
+        self._session_id = session_id or ""
+        hh = kwargs.get("hermes_home")
+        if hh:
+            self._hermes_home = Path(hh)
+        else:
+            self._hermes_home = _hermes_home()
+        self._turn_sequence = 0
+
+        # Narrative thread agent_ref (ADR-001 Option A1)
+        agent_ref = kwargs.get("agent_ref") or kwargs.get("agent_instance")
+        if agent_ref is not None:
+            self._agent_ref = agent_ref
+            logger.info(
+                "[hermes-local] initialize: A1 agent_ref captured (%s)",
+                type(agent_ref).__name__,
+            )
+        else:
+            self._agent_ref = None
+
+        logger.info(
+            "[hermes-local] Initialized for session=%s home=%s",
+            session_id,
+            self._hermes_home,
         )
+
+    # ── ABC: system_prompt_block ────────────────────────────────────────────
+
+    def system_prompt_block(self) -> str:
+        """Dynamic memory stats string injected into the system prompt."""
+        try:
+            from hermes_memory_core.store.sqlite import get_memory_store
+            store = get_memory_store()
+            conn = store._conn_or_init()
+            n_facts = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+            n_decisions = conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0]
+            n_questions = conn.execute(
+                "SELECT COUNT(*) FROM open_questions WHERE status='open'"
+            ).fetchone()[0]
+        except Exception as e:
+            logger.debug("[hermes-local] system_prompt_block stats failed: %s", e)
+            return (
+                "# Hermes Local Memory\n"
+                "Active. Lossless turn capture + hybrid retrieval (FTS5 + Qdrant + HRR).\n"
+                "Use memory_query to search, memory_recent_context for session warm-up, "
+                "memory_get_source to resolve source_refs."
+            )
+
+        if n_facts == 0 and n_decisions == 0 and n_questions == 0:
+            return (
+                "# Hermes Local Memory\n"
+                "Active. Empty store — turns are captured automatically and the dreamer "
+                "will extract facts/decisions/questions in the background.\n"
+                "Use memory_query to search, memory_recent_context for warm-up."
+            )
+
+        return (
+            f"# Hermes Local Memory\n"
+            f"Active. {n_facts} facts, {n_decisions} decisions, {n_questions} open questions.\n"
+            f"Use memory_query to search (modes: hybrid/semantic/keyword/facts/decisions/recent), "
+            f"memory_recent_context for session warm-up, memory_get_source to resolve refs."
+        )
+
+    # ── ABC: prefetch ───────────────────────────────────────────────────────
+
+    def prefetch(self, query: str, *, session_id: str = "") -> str:
+        """Recall relevant memory using hybrid search, falling back to FTS5.
+
+        Returns a markdown-formatted snippet block or empty string.
+        """
+        if not query or not query.strip():
+            return ""
+
+        # Use MemoryDB (subclass of MemoryStore) so backends that need
+        # _connect() work. fts5_search will auto-create one if we pass None,
+        # but constructing here keeps the call site explicit.
+        store = None
+        try:
+            from hermes_memory_core.store.sqlite import MemoryDB
+            store = MemoryDB()
+            store.initialize()
+        except Exception as e:
+            logger.debug("[hermes-local] prefetch: MemoryDB init failed: %s", e)
+            store = None
+
+        try:
+            from hermes_memory_core.search import hybrid as _hybrid
+
+            result = _hybrid.search(query, mode="hybrid", limit=5, memory_db=store)
+            hits = result.get("results", []) if isinstance(result, dict) else []
+            if hits:
+                return self._format_prefetch_hits(hits, source="hybrid")
+        except Exception as e:
+            logger.debug("[hermes-local] hybrid prefetch failed: %s — falling back to FTS5", e)
+
+        # Fallback: FTS5 keyword search
+        try:
+            from hermes_memory_core.search.fts5 import fts5_search
+
+            rows = fts5_search(query, filters={}, table="turns", limit=5, memory_db=store)
+            if rows:
+                return self._format_prefetch_hits(rows, source="fts5")
+        except Exception as e:
+            logger.debug("[hermes-local] FTS5 prefetch also failed: %s", e)
+
+        return ""
+
+    @staticmethod
+    def _format_prefetch_hits(hits: list, *, source: str) -> str:
+        lines = [f"## Hermes Local Memory ({source})"]
+        for h in hits[:5]:
+            content = (
+                h.get("content")
+                or h.get("snippet")
+                or h.get("fact_text")
+                or h.get("text")
+                or ""
+            )
+            if not content:
+                continue
+            score = h.get("score") or h.get("rank") or 0
+            try:
+                score_f = float(score)
+                lines.append(f"- [{score_f:.2f}] {content[:240]}")
+            except Exception:
+                lines.append(f"- {content[:240]}")
+        if len(lines) == 1:
+            return ""
+        return "\n".join(lines)
+
+    # ── ABC: sync_turn ──────────────────────────────────────────────────────
+
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+        """Persist a completed turn to SQLite + raw JSONL.
+
+        Writes user + assistant rows into the turns table via MemoryStore.
+        Best-effort: any write failure is logged but never raised — memory
+        write must never break the conversation.
+        """
+        sid = session_id or self._session_id or "unknown"
+        try:
+            from hermes_memory_core.store.sqlite import get_memory_store
+            store = get_memory_store()
+            store.upsert_session({
+                "session_id": sid,
+                "agent": "hermes",
+                "title": None,
+                "project": "default",
+                "started_at": _utc_iso(),
+                "ended_at": None,
+                "summary": None,
+                "qmd_path": None,
+                "raw_path": None,
+                "source": "agent",
+                "platform": os.environ.get("HERMES_PLATFORM", "cli"),
+                "created_at": _utc_iso(),
+                "updated_at": _utc_iso(),
+            })
+
+            for role, content in (("user", user_content), ("assistant", assistant_content)):
+                if not content:
+                    continue
+                self._turn_sequence += 1
+                turn_id = f"{sid}#t={self._turn_sequence:06d}"
+                content_hash = _content_hash(content)
+                store.insert_turn_if_not_exists({
+                    "turn_id": turn_id,
+                    "session_id": sid,
+                    "sequence": self._turn_sequence,
+                    "timestamp": _utc_iso(),
+                    "role": role,
+                    "content": content,
+                    "raw_content_hash": content_hash,
+                    "content_hash": content_hash,
+                    "project": "default",
+                    "tags_json": None,
+                    "tool_calls_json": None,
+                    "attachments_json": None,
+                    "metadata_json": None,
+                    "parent_turn_id": None,
+                    "index_status": "pending",
+                    "dream_status": "pending",
+                    "redaction_applied": 0,
+                    "redaction_types_json": None,
+                })
+        except Exception as e:
+            logger.warning("[hermes-local] sync_turn failed: %s", e)
+
+    # ── ABC: get_tool_schemas ───────────────────────────────────────────────
+
+    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+        """Return the read-side tool schemas exposed to the model."""
+        try:
+            tools = _sibling("tools")
+        except Exception as e:
+            logger.warning("[hermes-local] failed to import tools module: %s", e)
+            return []
+
         return [
-            MEMORY_WRITE_SCHEMA,
-            MEMORY_UPDATE_SCHEMA,
-            FACT_FEEDBACK_SCHEMA,
+            tools.MEMORY_QUERY_SCHEMA,
+            tools.MEMORY_GET_SOURCE_SCHEMA,
+            tools.MEMORY_RECENT_CONTEXT_SCHEMA,
         ]
 
-    def get_tool(self, name: str) -> Optional[Callable]:
-        """Return the tool function for name, or None."""
-        from plugins.memory.hermes_local import tools as memory_tools
-        tool_map = {
-            "memory_write": memory_tools.memory_write_tool,
-            "memory_update": memory_tools.memory_update_tool,
-            "fact_feedback": memory_tools.fact_feedback_tool,
-        }
-        return tool_map.get(name)
+    # ── ABC: handle_tool_call ───────────────────────────────────────────────
 
-    # ── Hooks ───────────────────────────────────────────────────────────────
+    def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+        """Dispatch to the tools module handler.
 
-    def on_session_end(self, session_id: str, turns: List[dict]) -> None:
-        """Called when a session ends. Capture turns to SQLite + JSONL."""
-        # Phase 1 (Epic 1.3.3): capture via sync_turn pipeline
-        logger.debug(f"[hermes-local] on_session_end: {session_id} ({len(turns)} turns)")
-
-    def on_session_switch(self, new_id: str, *, parent_id: Optional[str] = "", reset: bool = False, **kwargs) -> None:
-        """Called on /new, /resume, /branch. Inject narrative thread context.
-
-        ADR-001 Option A: bypass _cached_system_prompt by injecting prior
-        session context directly into conversation_history at index 0.
+        Returns a JSON string (the tool result).
         """
-        import logging as _logging
-        _logger = _logging.getLogger(__name__)
-        _logger.debug(f"[hermes-local] on_session_switch: {new_id} from {parent_id} reset={reset}")
+        import json
+        try:
+            tools = _sibling("tools")
+        except Exception as e:
+            return json.dumps({"error": f"tools module unavailable: {e}"})
 
-        # Phase 5 (Epic 5.1.2): narrative thread injection
-        if not parent_id:
+        try:
+            result = tools.handle_hermes_local_tool_call(tool_name, args or {})
+        except Exception as e:
+            logger.exception("[hermes-local] handle_tool_call(%s) raised", tool_name)
+            return json.dumps({"error": f"{tool_name} failed: {e}"})
+
+        if isinstance(result, str):
+            return result
+        try:
+            return json.dumps(result, default=str)
+        except Exception:
+            return json.dumps({"error": "result not JSON-serialisable", "repr": repr(result)})
+
+    # ── ABC: shutdown ───────────────────────────────────────────────────────
+
+    def shutdown(self) -> None:
+        """Close any open connections and flush pending writes."""
+        # Close MemoryDB (init.py) if cached
+        try:
+            if self._memory_db is not None and hasattr(self._memory_db, "close"):
+                self._memory_db.close()
+        except Exception as e:
+            logger.debug("[hermes-local] shutdown MemoryDB.close failed: %s", e)
+        finally:
+            self._memory_db = None
+
+        # Close the MemoryStore singleton too
+        try:
+            from hermes_memory_core.store.sqlite import get_memory_store
+            store = get_memory_store()
+            if hasattr(store, "close"):
+                store.close()
+                logger.info("[hermes-local] MemoryStore connection closed.")
+        except Exception as e:
+            logger.debug("[hermes-local] shutdown MemoryStore.close failed: %s", e)
+
+    # ── Optional hook: on_session_end ──────────────────────────────────────
+
+    def on_session_end(self, messages) -> None:
+        """Called when a session ends. Phase 1 (Epic 1.3.3): handled via sync_turn pipeline."""
+        try:
+            n = len(messages) if messages is not None else 0
+        except TypeError:
+            n = 0
+        logger.debug("[hermes-local] on_session_end: %s (%d turns)", self._session_id, n)
+
+    # ── Optional hook: on_session_switch (narrative thread) ────────────────
+
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        **kwargs,
+    ) -> None:
+        """Update internal session_id; inject prior narrative thread on resume."""
+        logger.debug(
+            "[hermes-local] on_session_switch: %s from %s reset=%s",
+            new_session_id, parent_session_id, reset,
+        )
+        self._session_id = new_session_id or self._session_id
+        self._turn_sequence = 0
+
+        if not parent_session_id or reset:
             self._nt_prev_content = ""
             self._nt_first_turn_done = False
             return
 
-        # Read prior session's thread file
         try:
-            from plugins.memory.hermes_local.narrative import _read_thread_file
-            focus, exchanges, turn_count = _read_thread_file(parent_id)
+            narrative = _sibling("narrative")
+            focus, exchanges, turn_count = narrative._read_thread_file(parent_session_id)
         except Exception as e:
-            _logger.warning("[hermes-local] on_session_switch: failed to read thread %s — %s", parent_id, e)
+            logger.warning(
+                "[hermes-local] on_session_switch: read_thread_file(%s) failed — %s",
+                parent_session_id, e,
+            )
             self._nt_prev_content = ""
             self._nt_first_turn_done = False
             return
 
         if not focus and not exchanges:
-            _logger.debug("[hermes-local] on_session_switch: no prior thread content for %s", parent_id)
             self._nt_prev_content = ""
             self._nt_first_turn_done = False
             return
 
-        # Build _nt_prev_content from thread data
         lines = []
         if focus:
             lines.append(f"Current Focus: {focus}")
-        if turn_count > 0:
+        if turn_count:
             lines.append(f"Turns This Session: {turn_count}")
         if exchanges:
             lines.append("Recent Exchanges:")
@@ -165,42 +502,45 @@ class HermesLocalProvider:
 
         self._nt_prev_content = "\n".join(lines)
         self._nt_first_turn_done = False
+        self._inject_narrative_message()
 
-        # Inject immediately if this is a reset=False session switch (e.g. /new with parent)
-        # For reset=True (/reset), we skip injection — fresh session
-        if not reset:
-            self._inject_narrative_message()
-        else:
-            _logger.debug("[hermes-local] on_session_switch: reset=True — skipping injection (fresh session)")
+    # ── Optional hook: on_pre_compress ─────────────────────────────────────
 
-    def on_pre_compress(self, session_id: str) -> dict:
-        """Called before context compression. Return prefetched context."""
-        # Phase 4 (prefetch.py): hybrid prefetch for compression
-        logger.debug(f"[hermes-local] on_pre_compress: {session_id}")
-        return {}
+    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
+        """Return text to preserve through compression. Currently empty."""
+        logger.debug("[hermes-local] on_pre_compress: %d messages", len(messages or []))
+        return ""
 
-    def on_memory_write(self, memory_type: str, text: str, source_ref: str, **kwargs) -> dict:
-        """Called when Hermes core triggers a memory write."""
-        # Epic 4.4.1: delegate to canonical pipeline
-        from hermes_memory_core import write_memory
-        return write_memory(
-            memory_type=memory_type,
-            text=text,
-            source_ref=source_ref,
-            project=kwargs.get("project"),
-            scope=kwargs.get("scope") or "general",
-            confidence=kwargs.get("confidence"),
-            tags=kwargs.get("tags"),
-            rationale=kwargs.get("rationale"),
-            owner=kwargs.get("owner"),
-            priority=kwargs.get("priority"),
-        )
+    # ── Optional hook: on_memory_write ─────────────────────────────────────
 
-    def on_delegation(self, agent: str, task: str, context: dict) -> None:
-        """Called when a delegation occurs. Track for memory."""
-        logger.debug(f"[hermes-local] on_delegation: {agent} <- {task}")
+    def on_memory_write(
+        self,
+        action: str,
+        target: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Mirror built-in memory tool writes via the canonical pipeline."""
+        if action != "add" or not content:
+            return
+        try:
+            from hermes_memory_core.write.pipeline import write_memory
+            scope = "user" if target == "user" else "general"
+            write_memory(
+                memory_type="fact",
+                text=content,
+                scope=scope,
+                source_ref=(metadata or {}).get("source_ref") or "memory_tool",
+            )
+        except Exception as e:
+            logger.debug("[hermes-local] on_memory_write mirror failed: %s", e)
 
-    # ── DB access ───────────────────────────────────────────────────────────
+    # ── Optional hook: on_delegation ───────────────────────────────────────
+
+    def on_delegation(self, task: str, result: str, *, child_session_id: str = "", **kwargs) -> None:
+        logger.debug("[hermes-local] on_delegation: child=%s task=%r", child_session_id, task[:80])
+
+    # ── DB access ──────────────────────────────────────────────────────────
 
     @property
     def db(self):
@@ -210,51 +550,20 @@ class HermesLocalProvider:
             self._memory_db = get_memory_db()
         return self._memory_db
 
-    # ── Provider initialization (ADR-001 Option A1) ─────────────────────────
+    # ── Narrative thread injection (Phase 5) ───────────────────────────────
 
-    def initialize(self, session_id: str, **kwargs) -> None:
-        """Called by MemoryManager at activation.
-
-        ADR-001 Option A1: capture agent_ref from kwargs if present.
-        The three-tier fallback (A1 → A2 → A3) is implemented in
-        _get_agent_ref() for use during on_session_switch.
-        """
-        import logging as _logging
-        _logger = _logging.getLogger(__name__)
-        # A1: agent_ref from Hermes kwargs (preferred path — clean, no reflection)
-        agent_ref = kwargs.get("agent_ref") or kwargs.get("agent_instance")
-        if agent_ref is not None:
-            self._agent_ref = agent_ref
-            _logger.info("[hermes-local] on_session_switch agent_ref: A1 (kwargs) — %s", type(agent_ref).__name__)
-        else:
-            # A2/A3 deferred to _get_agent_ref() — called at injection time, not here
-            self._agent_ref = None
-            _logger.debug("[hermes-local] on_session_switch agent_ref: A1 not available (defer to _get_agent_ref)")
+    MAX_INJECTION_CHARS: int = 4000
 
     def _get_agent_ref(self) -> Optional[Any]:
-        """Three-tier agent_ref resolution per ADR-001 commitments.
-
-        Returns the AIAgent reference via:
-          A1: stored self._agent_ref (from initialize kwargs)
-          A2: inspect MemoryManager._agent reflectively
-          A3: reflective _invalidate_system_prompt() call
-
-        Returns None if all three tiers fail (test passes, logs warning).
-        """
-        import logging as _logging
+        """Three-tier agent_ref resolution (A1 stored → A2 stack walk → A3 None)."""
         import inspect as _inspect
-        _logger = _logging.getLogger(__name__)
 
-        # A1: stored from initialize()
         if self._agent_ref is not None:
-            _logger.info("[hermes-local] _get_agent_ref: A1 (stored) — %s", type(self._agent_ref).__name__)
             return self._agent_ref
-
-        # A2: walk call stack to find MemoryManager instance
         try:
             for frame_info in _inspect.stack():
                 local_vars = frame_info.frame.f_locals
-                for var_name, var_val in local_vars.items():
+                for var_val in local_vars.values():
                     if (
                         hasattr(var_val, "_agent")
                         and hasattr(var_val, "on_session_switch")
@@ -262,51 +571,24 @@ class HermesLocalProvider:
                     ):
                         agent = getattr(var_val, "_agent", None)
                         if agent is not None:
-                            _logger.info("[hermes-local] _get_agent_ref: A2 (MemoryManager._agent) — %s", type(agent).__name__)
                             return agent
         except Exception as e:
-            _logger.warning("[hermes-local] _get_agent_ref: A2 failed — %s", e)
-
-        # A3: reflective _invalidate_system_prompt (last resort)
-        # We return None here; caller falls back to logging-and-proceeding
-        _logger.warning("[hermes-local] _get_agent_ref: A3 fallback triggered (agent unavailable)")
+            logger.debug("[hermes-local] _get_agent_ref A2 failed: %s", e)
         return None
 
-    # ── Narrative thread injection (Phase 5, Epic 5.1.2) ────────────────────
-
-    MAX_INJECTION_CHARS: int = 4000  # configurable via narrative_thread.max_injection_chars
-
     def _inject_narrative_message(self) -> None:
-        """Inject the prior-session thread as a user message at index 0.
-
-        Bypasses the _cached_system_prompt bottleneck (ADR-001 Option A).
-        Injection is capped at MAX_INJECTION_CHARS to bound token cost.
-        """
-        import logging as _logging
-        _logger = _logging.getLogger(__name__)
-
-        if not self._nt_prev_content:
+        """Inject prior-session thread as a user message at index 0 of conversation_history."""
+        if not self._nt_prev_content or self._nt_first_turn_done:
             return
-
-        if self._nt_first_turn_done:
-            _logger.debug("[hermes-local] _inject_narrative_message: already injected, skipping")
-            return
-
         agent = self._get_agent_ref()
         if agent is None:
-            _logger.warning(
-                "[hermes-local] _inject_narrative_message: agent unavailable — "
-                "A1/A2/A3 all failed; proceeding without injection"
-            )
+            logger.debug("[hermes-local] _inject_narrative_message: no agent_ref available")
             return
 
-        # Cap injection content
         content = self._nt_prev_content
         if len(content) > self.MAX_INJECTION_CHARS:
             content = content[: self.MAX_INJECTION_CHARS] + "\n[…thread truncated]"
-            _logger.debug("[hermes-local] injection capped to %d chars", self.MAX_INJECTION_CHARS)
 
-        # Construct the injection message per ADR-001 directive
         injection = {
             "role": "user",
             "content": (
@@ -318,36 +600,35 @@ class HermesLocalProvider:
             "metadata": {"source": "narrative_thread_injection"},
         }
 
-        # Inject at index 0 of conversation_history
         try:
             conv_history = getattr(agent, "conversation_history", None)
-            if conv_history is not None and isinstance(conv_history, list):
+            if isinstance(conv_history, list):
                 conv_history.insert(0, injection)
                 self._nt_first_turn_done = True
-                _logger.info(
-                    "[hermes-local] Injected narrative thread message at index 0 "
-                    "(len=%d, session=%s)", len(content), getattr(agent, "session_id", "?")
-                )
-            else:
-                _logger.warning(
-                    "[hermes-local] agent.conversation_history not accessible "
-                    "(type=%s) — cannot inject", type(conv_history).__name__
+                logger.info(
+                    "[hermes-local] Injected narrative thread (len=%d, session=%s)",
+                    len(content), getattr(agent, "session_id", "?"),
                 )
         except Exception as e:
-            _logger.warning("[hermes-local] Failed to inject narrative message: %s", e)
+            logger.warning("[hermes-local] narrative injection failed: %s", e)
+
+    # ── Diagnostics ────────────────────────────────────────────────────────
 
     def health_check(self) -> dict:
-        """Return provider health status."""
         try:
-            db_health = self.db.health_check()
-            return {"provider": "hermes-local", "db": db_health}
+            return {"provider": self.name, "db": self.db.health_check()}
         except Exception as e:
-            return {"provider": "hermes-local", "status": "error", "error": str(e)}
+            return {"provider": self.name, "status": "error", "error": str(e)}
 
 
 # ---------------------------------------------------------------------------
-# Module-level activate (called by plugin loader)
+# Module-level helpers
 # ---------------------------------------------------------------------------
+
+def is_available() -> bool:
+    """Module-level convenience for callers that don't have an instance."""
+    return HermesLocalProvider().is_available()
+
 
 _provider: Optional[HermesLocalProvider] = None
 
@@ -362,3 +643,16 @@ def activate() -> HermesLocalProvider:
 
 def get_provider() -> Optional[HermesLocalProvider]:
     return _provider
+
+
+# ---------------------------------------------------------------------------
+# Private utilities
+# ---------------------------------------------------------------------------
+
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _content_hash(text: str) -> str:
+    import hashlib
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()

@@ -297,11 +297,8 @@ def _handle_memory_write(params: dict[str, Any]) -> dict[str, Any]:
 
     text = params.get("text", "")
     # Redact before storing
-    redacted: "RedactionResult" = redact(text)
-    tags = _parse_tags(params.get("tags"))
-    if tags is not None:
-        import json
-        tags = json.dumps(tags)  # write_memory expects List[str], redact expects plain text
+    redacted = redact(text)
+    tags = _parse_tags(params.get("tags"))  # list[str] | None — what write_memory wants
 
     result = write_memory(
         memory_type  = params.get("type", "fact"),
@@ -314,6 +311,7 @@ def _handle_memory_write(params: dict[str, Any]) -> dict[str, Any]:
         rationale    = params.get("rationale"),
         owner        = params.get("owner"),
         priority     = params.get("priority"),
+        skip_redaction=True,  # we already redacted above
     )
 
     return {
@@ -321,7 +319,8 @@ def _handle_memory_write(params: dict[str, Any]) -> dict[str, Any]:
         "id":         result.get("id"),
         "type":       params.get("type"),
         "text":       redacted.redacted_text,
-        "redacted":   redacted.redacted,
+        "redacted":   bool(redacted.types_found),
+        "redaction_types": redacted.types_found,
         "message":    f"Written: {params.get('type')} — {redacted.redacted_text[:80]}",
     }
 

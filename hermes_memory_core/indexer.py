@@ -49,6 +49,14 @@ class BatchIndexResult:
 # batch_index — the main entry point used by IndexerWorker and callable directly
 # ---------------------------------------------------------------------------
 
+def _stable_uuid(prefix: str, key: str) -> str:
+    """Deterministic UUIDv5 string. Forward-declared here so _index_session
+    can use it; the duplicate later in the file is kept for backward compat.
+    """
+    import uuid
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{prefix}:{key}"))
+
+
 def batch_index(
     memory_db,
     batch_size: int = 20,
@@ -122,7 +130,7 @@ def batch_index(
         })
         result.processed += 1
 
-    # Step 2: for each session group, chunk → embed → Qdrant
+    # Step 2: for each session group, chunk → embed → Qdrant → SQLite
     for session_id, turns in session_turns.items():
         session_failed = _index_session(
             turns=turns,
@@ -130,6 +138,7 @@ def batch_index(
             qdrant_client=qdrant_client,
             collection_name=collection_name,
             result=result,
+            memory_db=memory_db,
         )
         if session_failed:
             failed_turn_ids.update(session_failed)
@@ -146,6 +155,7 @@ def _index_session(
     qdrant_client: QdrantClient,
     collection_name: str,
     result: BatchIndexResult,
+    memory_db=None,
 ) -> set:
     """
     Index a single session's worth of turns: chunk → embed → Qdrant.
@@ -188,26 +198,58 @@ def _index_session(
         # Mark all turns in this session as failed
         return {t["turn_id"] for t in turns}
 
-    # 2d. Build Qdrant points
+    # 2d. Build Qdrant points (Qdrant IDs must be UUID or int — derive UUIDv5
+    # from the deterministic chunk_id) and assemble matching SQLite rows.
+    import datetime as _dt
+
+    now_iso = _dt.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    embed_model_name = getattr(embed_client, "model", None) or "text-embedding-nomic-embed-text-v1.5"
+
     points = []
+    sqlite_rows = []
     for chunk, embedding in zip(chunk_dicts, embeddings):
+        qdrant_point_id = _stable_uuid("chunk", chunk["chunk_id"])
+        chunk_type = chunk.get("chunk_type", "conversation")
+        source_ref = f"session:{chunk['session_id']}:{chunk['start_turn_id']}-{chunk['end_turn_id']}"
         points.append(
             PointStruct(
-                id=chunk["chunk_id"],
+                id=qdrant_point_id,
                 vector=embedding,
                 payload={
+                    "memory_type": "chunk",
                     "chunk_id": chunk["chunk_id"],
                     "session_id": chunk["session_id"],
                     "start_turn_id": chunk["start_turn_id"],
                     "end_turn_id": chunk["end_turn_id"],
-                    "chunk_type": chunk["chunk_type"],
+                    "chunk_type": chunk_type,
                     "text": chunk["text"],
                     "text_hash": chunk["text_hash"],
-                    "role_mix": chunk["role_mix"],
-                    "turn_count": chunk["turn_count"],
-                    "embed_model": chunk["embed_model"],
-                    "chunker_version": chunk["chunker_version"],
+                    "role_mix": chunk.get("role_mix", ""),
+                    "turn_count": chunk.get("turn_count", 0),
+                    "embed_model": chunk.get("embed_model", embed_model_name),
+                    "chunker_version": chunk.get("chunker_version", "v1"),
+                    "source_ref": source_ref,
+                    "date": now_iso[:10],
+                    "created_at": now_iso,
                 },
+            )
+        )
+        sqlite_rows.append(
+            (
+                chunk["chunk_id"],
+                chunk["session_id"],
+                chunk["start_turn_id"],
+                chunk["end_turn_id"],
+                chunk_type,
+                None,  # project
+                chunk["text"],
+                chunk["text_hash"],
+                None,  # summary
+                source_ref,
+                qdrant_point_id,
+                chunk.get("embed_model", embed_model_name),
+                now_iso,  # created_at
+                now_iso,  # updated_at
             )
         )
 
@@ -222,6 +264,28 @@ def _index_session(
         logger.error("Qdrant upsert failed for session %s: %s", turns[0]["session_id"], exc)
         result.errors.append(f"Qdrant upsert failed: {exc}")
         return {t["turn_id"] for t in turns}
+
+    # 2f. Persist chunks into SQLite chunks table (idempotent via INSERT OR REPLACE
+    # on chunk_id PK; UNIQUE(text_hash, embed_model) guards content duplicates).
+    if memory_db is not None and sqlite_rows:
+        try:
+            conn = memory_db._connect()
+            try:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO chunks ("
+                    "  chunk_id, session_id, start_turn_id, end_turn_id, chunk_type,"
+                    "  project, text, text_hash, summary, source_ref, qdrant_point_id,"
+                    "  embed_model, created_at, updated_at"
+                    ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    sqlite_rows,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.error("SQLite chunks insert failed for session %s: %s", turns[0]["session_id"], exc)
+            result.errors.append(f"SQLite chunks insert failed: {exc}")
+            # Don't fail the whole batch — Qdrant has the data; sqlite is best-effort
 
     return failed
 
@@ -392,12 +456,6 @@ def stop_worker() -> None:
 # graph from the CLI entry point).
 _COLLECTION_FACTS = "hermes_memory_facts_nomic_v15"
 _COLLECTION_DECISIONS = "hermes_memory_decisions_nomic_v15"
-
-
-def _stable_uuid(prefix: str, key: str) -> str:
-    """Deterministic UUIDv5 string for a memory row. Qdrant requires UUID or int IDs."""
-    import uuid
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{prefix}:{key}"))
 
 
 def backfill_facts(

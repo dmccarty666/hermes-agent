@@ -232,16 +232,20 @@ CREATE TRIGGER IF NOT EXISTS turns_fts_au AFTER UPDATE ON turns BEGIN
 END;
 
 CREATE TRIGGER IF NOT EXISTS chunks_fts_ai AFTER INSERT ON chunks BEGIN
-  INSERT INTO chunks_fts(rowid, chunk_text) VALUES (NEW.rowid, NEW.chunk_text);
+  INSERT INTO chunks_fts(rowid, text, chunk_id, session_id, project, source_ref)
+  VALUES (NEW.rowid, NEW.text, NEW.chunk_id, NEW.session_id, NEW.project, NEW.source_ref);
 END;
 
 CREATE TRIGGER IF NOT EXISTS chunks_fts_ad AFTER DELETE ON chunks BEGIN
-  INSERT INTO chunks_fts(chunks_fts, rowid, chunk_text) VALUES('delete', OLD.rowid, OLD.chunk_text);
+  INSERT INTO chunks_fts(chunks_fts, rowid, text, chunk_id, session_id, project, source_ref)
+  VALUES('delete', OLD.rowid, OLD.text, OLD.chunk_id, OLD.session_id, OLD.project, OLD.source_ref);
 END;
 
 CREATE TRIGGER IF NOT EXISTS chunks_fts_au AFTER UPDATE ON chunks BEGIN
-  INSERT INTO chunks_fts(chunks_fts, rowid, chunk_text) VALUES('delete', OLD.rowid, OLD.chunk_text);
-  INSERT INTO chunks_fts(rowid, chunk_text) VALUES (NEW.rowid, NEW.chunk_text);
+  INSERT INTO chunks_fts(chunks_fts, rowid, text, chunk_id, session_id, project, source_ref)
+  VALUES('delete', OLD.rowid, OLD.text, OLD.chunk_id, OLD.session_id, OLD.project, OLD.source_ref);
+  INSERT INTO chunks_fts(rowid, text, chunk_id, session_id, project, source_ref)
+  VALUES (NEW.rowid, NEW.text, NEW.chunk_id, NEW.session_id, NEW.project, NEW.source_ref);
 END;
 
 CREATE TRIGGER IF NOT EXISTS facts_fts_ai AFTER INSERT ON facts BEGIN

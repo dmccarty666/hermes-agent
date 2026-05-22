@@ -151,8 +151,10 @@ def test_scenario_F_health_check_reports_qdrant_down():
     if not _is_qdrant_up():
         # Qdrant already down — check health directly
         try:
+            import qdrant_client
             from hermes_memory_core.health import check_qdrant
-            health = check_qdrant()
+            client = qdrant_client.QdrantClient(url="http://localhost:6333", timeout=2)
+            health = check_qdrant(client)
             assert health.get("status") in ("error", "unreachable", "down"), \
                 f"Expected error status when Qdrant down, got: {health}"
         except ImportError:

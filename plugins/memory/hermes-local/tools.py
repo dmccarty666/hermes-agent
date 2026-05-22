@@ -13,16 +13,16 @@ from typing import Any
 MEMORY_QUERY_SCHEMA = {
     "name": "memory_query",
     "description": (
-        "Search the local memory. Default mode 'semantic' uses embeddings for conceptual match. "
-        "Other modes: 'keyword', 'facts', 'decisions', 'open_questions', "
-        "'sessions', 'daily', 'project', 'recent', 'probe', 'related', 'reason', 'hybrid' (combines all — "
-        "currently degraded, falls back to semantic)."
+        "Search the local memory. Default mode 'hybrid' fuses FTS keyword + Qdrant semantic + "
+        "Jaccard + HRR for the most robust ranked retrieval — recommended for most queries. "
+        "Other modes: 'semantic' (embedding-only), 'keyword', 'facts', 'decisions', "
+        "'open_questions', 'sessions', 'daily', 'project', 'recent', 'probe', 'related', 'reason'."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "query":   {"type": "string"},
-            "mode":    {"type": "string", "default": "semantic"},
+            "mode":    {"type": "string", "default": "hybrid"},
             "project": {"type": "string"},
             "entity":  {"type": "string"},
             "entities": {"type": "array", "items": {"type": "string"}},
@@ -273,7 +273,7 @@ def _handle_memory_query(params: dict[str, Any]) -> dict[str, Any]:
 
     store = get_memory_store()
     query  = params.get("query", "")
-    mode   = params.get("mode", "semantic")
+    mode   = params.get("mode", "hybrid")
     project = params.get("project")
     entity  = params.get("entity")
     limit  = params.get("limit", 10)

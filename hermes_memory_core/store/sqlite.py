@@ -321,6 +321,26 @@ class MemoryStore:
         assert self._conn is not None
         return self._conn
 
+    def _connect(self) -> sqlite3.Connection:
+        """Return a short-lived raw connection.
+
+        Some search paths (FTS5, hybrid trust-score lookup, indexer) expect to
+        get their own sqlite3 connection so they can run raw SQL with custom
+        row factories or commits without touching this store's owned
+        connection. We flush any pending writes on the owned connection so
+        the new handle sees consistent data, then return a fresh connection
+        the caller is responsible for closing.
+
+        Mirrors ``MemoryDB._connect()`` so any code that received a base
+        ``MemoryStore`` (e.g. via ``get_memory_store()``) still works without
+        having to know which concrete subclass it holds.
+        """
+        self._ensure_init()
+        owned = getattr(self, "_conn", None)
+        if owned is not None and owned.in_transaction:
+            owned.commit()
+        return sqlite3.connect(str(self._db_path), timeout=30.0)
+
     def close(self) -> None:
         with self._lock:
             if self._conn:

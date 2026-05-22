@@ -188,21 +188,51 @@ def _search_fts(
     limit: int,
     memory_db: Any,
 ) -> List[Dict[str, Any]]:
-    """Call fts5_search against the chunks table."""
+    """Call fts5_search against the chunks + facts + decisions tables.
+
+    Why all three? Hybrid retrieval should surface any memory regardless of
+    where it lives. The chunks table is the canonical source for turn-derived
+    content, while facts/decisions hold curated knowledge that dream produced.
+    We merge raw hits here; ``_dedup_results`` collapses true duplicates by
+    content hash downstream.
+
+    Per-table failures are isolated (logged + skipped) so e.g. an empty
+    chunks FTS doesn't kill a fact-only query.
+    """
     global fts5_search
     if fts5_search is None:
         fts5_search = _reload_fts5_search()
-    try:
-        return fts5_search(
-            query=query,
-            filters=filters,
-            table="chunks",
-            limit=limit,
-            memory_db=memory_db,
-        )
-    except Exception as exc:
-        logger.warning("FTS search failed: %s", exc)
-        return []
+
+    merged: List[Dict[str, Any]] = []
+    for table in ("chunks", "facts", "decisions"):
+        try:
+            rows = fts5_search(
+                query=query,
+                filters=filters,
+                table=table,
+                limit=limit,
+                memory_db=memory_db,
+            )
+        except Exception as exc:
+            logger.warning("FTS search failed (table=%s): %s", table, exc)
+            continue
+        # Normalize the content + id keys so _dedup_results can handle facts
+        # and decisions the same way it handles chunks.
+        for r in rows:
+            if table == "facts":
+                r.setdefault("content", r.get("fact_text", ""))
+                r.setdefault("chunk_id", r.get("fact_id", ""))
+                r.setdefault("session_id", "")
+            elif table == "decisions":
+                r.setdefault("content", r.get("decision_text", ""))
+                r.setdefault("chunk_id", r.get("decision_id", ""))
+                r.setdefault("session_id", "")
+            else:  # chunks
+                r.setdefault("content", r.get("chunk_text", ""))
+            r["_fts_table"] = table
+        merged.extend(rows)
+
+    return merged
 
 
 def _search_qdrant(
@@ -210,15 +240,57 @@ def _search_qdrant(
     filters: Dict[str, Any],
     limit: int,
 ) -> List[Dict[str, Any]]:
-    """Call semantic_search against Qdrant."""
+    """Call semantic_search against Qdrant across chunks + facts + decisions.
+
+    semantic_search() takes a single ``collection`` arg, so we call it once
+    per memory-bearing collection and merge. Per-collection failures are
+    isolated.
+    """
     global semantic_search
     if semantic_search is None:
         semantic_search = _reload_semantic_search()
-    try:
-        return semantic_search(query=query, filters=filters, limit=limit)
-    except Exception as exc:
-        logger.warning("Qdrant search failed: %s", exc)
-        return []
+
+    collections = (
+        ("hermes_memory_chunks_nomic_v15", "chunk"),
+        ("hermes_memory_facts_nomic_v15", "fact"),
+        ("hermes_memory_decisions_nomic_v15", "decision"),
+    )
+
+    merged: List[Dict[str, Any]] = []
+    for collection, kind in collections:
+        try:
+            hits = semantic_search(
+                query=query,
+                filters=filters,
+                limit=limit,
+                collection=collection,
+            )
+        except TypeError:
+            # Older signature (no `collection` kwarg) — only the chunks
+            # collection is queried.
+            if kind != "chunk":
+                continue
+            try:
+                hits = semantic_search(query=query, filters=filters, limit=limit)
+            except Exception as exc:
+                logger.warning("Qdrant search failed (collection=%s): %s", collection, exc)
+                continue
+        except Exception as exc:
+            logger.warning("Qdrant search failed (collection=%s): %s", collection, exc)
+            continue
+
+        # Tag origin so callers / debug logs know which collection produced
+        # the hit, and patch the content field for fact/decision payloads
+        # (which use ``text`` instead of ``content`` from semantic.py defaults).
+        for h in hits:
+            h["_qdrant_collection"] = collection
+            if not h.get("content"):
+                payload_text = (h.get("metadata") or {}).get("text") or h.get("text")
+                if payload_text:
+                    h["content"] = payload_text
+        merged.extend(hits)
+
+    return merged
 
 
 # -------------------------------------------------------------------------- #

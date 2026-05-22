@@ -98,6 +98,30 @@ def fts5_search(
     content_col = _CONTENT_COL[table]
     join_cols   = _EXTRA_JOIN_COLS[table]
 
+    # Resolve the actual base-table content column. Two schemas have shipped
+    # for ``chunks``: ``chunk_text`` (MemoryDB's _FULL_SCHEMA_MEMORY_DB) and
+    # ``text`` (MemoryStore's _SCHEMA_SQL). If the configured column doesn't
+    # exist on the live DB, fall back to the alternative so callers don't see
+    # ``no such column`` errors. This is read-only; it does not migrate.
+    try:
+        # Use a short-lived probe connection (don't hold the caller's conn yet).
+        from hermes_memory_core.store.sqlite import MemoryDB as _ProbeMDB
+        _probe_db = memory_db if memory_db is not None else _ProbeMDB()
+        if memory_db is None:
+            _probe_db.initialize()
+        _probe_conn = _probe_db._connect()
+        try:
+            _cols = {r[1] for r in _probe_conn.execute(f"PRAGMA table_info({base_table})")}
+            if content_col not in _cols:
+                if table == "chunks" and "text" in _cols:
+                    content_col = "text"
+                elif table == "chunks" and "chunk_text" in _cols:
+                    content_col = "chunk_text"
+        finally:
+            _probe_conn.close()
+    except Exception:
+        pass  # best-effort; if probe fails the original column name is used
+
     # FTS5 virtual tables only expose the content column plus rowid.
     # We match in FTS5 for ranking + snippet, then join on rowid to get
     # the business-key columns from the base table.

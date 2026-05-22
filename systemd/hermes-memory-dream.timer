@@ -1,0 +1,13 @@
+[Unit]
+Description=Hermes Local Memory — Dreamer Timer (fires daily at 03:00 local time)
+Requires=hermes-memory-dream.service
+
+[Timer]
+# Fire at 03:00 local time every day
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+# Randomize up to 5 minutes to avoid thundering-herd on the LLM server
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

@@ -192,6 +192,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=("connect", "disconnect", "status")),
     CommandDef("plugins", "List installed plugins and their status",
                "Tools & Skills", cli_only=True),
+    CommandDef("memory", "Initialize or inspect the local memory store",
+               "Tools & Skills", cli_only=True,
+               subcommands=("init",)),
 
     # Info
     CommandDef("commands", "Browse all commands and skills (paginated)", "Info",

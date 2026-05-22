@@ -9124,6 +9124,34 @@ class GatewayRunner:
         except Exception:
             pass
 
+        # Inject narrative thread into the new session's MemoryManager via
+        # on_session_switch.  Unlike the CLI which calls on_session_switch
+        # directly in its /new handler, the gateway routes both /new and
+        # /reset through _handle_reset_command.  Distinguish via event.get_command():
+        # - /new (canonical "new"): reset=False — preserve narrative thread
+        # - /reset (canonical "reset"): reset=True — fresh session, no injection
+        # The old agent still has _memory_manager set because we evict from
+        # the cache AFTER this block but BEFORE the new agent is created.
+        try:
+            _old_sid = old_entry.session_id if old_entry else None
+            _new_sid = new_entry.session_id if new_entry else None
+            _cmd = event.get_command()
+            _is_reset = _cmd == "reset"
+            # _old_agent is set in the cache-lock block above (line 8112).
+            # Use getattr with a sentinel to avoid "possibly unbound" warning.
+            _sentinel = object()
+            _maybe_mm = getattr(_old_agent, "_memory_manager", _sentinel)
+            if _maybe_mm is not _sentinel and _maybe_mm is not None and _new_sid:
+                _mm: Any = _maybe_mm  # type narrowing — we know it's the MemoryManager
+                _mm.on_session_switch(
+                    _new_sid,
+                    parent_session_id=_old_sid or "",
+                    reset=_is_reset,
+                    reason="gateway_reset",
+                )
+        except Exception:
+            pass
+
         # Append a random tip to the reset message
         try:
             from hermes_cli.tips import get_random_tip

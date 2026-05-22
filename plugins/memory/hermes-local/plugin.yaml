@@ -1,0 +1,9 @@
+name: hermes-local
+version: 0.2.0
+description: "Hermes Local Memory — lossless capture, hybrid retrieval, dreaming, narrative thread (local-first, zero per-token cost)."
+hooks:
+  - on_session_end
+  - on_session_switch
+  - on_pre_compress
+  - on_memory_write
+  - on_delegation

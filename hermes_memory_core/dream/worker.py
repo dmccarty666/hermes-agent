@@ -85,9 +85,11 @@ PROJECTS_DIR = Path(HERMES_HOME) / "memory" / "projects"
 
 DREAM_LLM_URL     = "http://192.168.2.105:1234/v1"
 DREAM_LLM_MODEL   = "qwen3.6-35b-instruct"
-LMS_TIMEOUT       = 120.0
+LMS_TIMEOUT       = 240.0
 TEMPERATURE       = 0.0
-MAX_TOKENS        = 4096
+# 4096 was truncating fact-extraction JSON mid-array on 3+ turn sessions,
+# producing un-parseable output. 8192 leaves comfortable headroom.
+MAX_TOKENS        = 8192
 
 
 def _utc_now() -> str:
@@ -313,6 +315,21 @@ class DreamWorker:
             "DreamWorker.run started: dream_run_id=%s scope=%s",
             self._dream_run_id, scope,
         )
+
+        # Insert the dream_runs row up front (status='running') so the UPDATE
+        # in complete_dream_run() has something to land on. Without this the
+        # dream_runs table stays empty forever.
+        try:
+            self.store.create_dream_run(
+                dream_run_id=self._dream_run_id,
+                scope_json=self._scope_input,
+                llm_model=DREAM_LLM_MODEL,
+                llm_endpoint=DREAM_LLM_URL,
+            )
+        except Exception as exc:
+            # Don't kill the run — log and continue. complete_dream_run's UPDATE
+            # will simply no-op, matching prior (broken) behavior.
+            logger.warning("create_dream_run failed (continuing): %s", exc)
 
         try:
             # Stage 1: scope selection
@@ -1249,19 +1266,66 @@ class DreamWorker:
     # ── Helper methods ────────────────────────────────────────────────────────
 
     def _parse_json_array(self, raw: str) -> List[Dict[str, Any]]:
-        """Parse a JSON array from LLM output, stripping markdown fences if present."""
+        """Parse a JSON array from LLM output.
+
+        Robust to: markdown code fences, prose preamble/postamble, single-dict
+        responses, and ``Here are the facts: [...]`` patterns from chatty models.
+        Returns ``[]`` and logs the raw response if every parse attempt fails —
+        never raises, so one bad session can't kill the whole dream run.
+        """
+        import re
+
+        if not raw or not raw.strip():
+            return []
+
         text = raw.strip()
-        # Strip markdown code fences
-        if text.startswith("```"):
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-        text = text.strip()
-        parsed = json.loads(text)
-        # Handle single dict returned instead of list
-        if isinstance(parsed, dict):
-            return [parsed]
-        return parsed
+
+        # ── Attempt 1: strip ```json ... ``` or ``` ... ``` fences ─────────
+        candidates: List[str] = []
+        fence_match = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+        if fence_match:
+            candidates.append(fence_match.group(1).strip())
+
+        # ── Attempt 2: original (no fences) behavior — direct parse ───────
+        cleaned = text
+        if cleaned.startswith("```"):
+            parts = cleaned.split("```")
+            if len(parts) >= 2:
+                cleaned = parts[1]
+                if cleaned.lower().startswith("json"):
+                    cleaned = cleaned[4:]
+        candidates.append(cleaned.strip())
+
+        # ── Attempt 3: extract first '[' ... last ']' substring ───────────
+        lb, rb = text.find("["), text.rfind("]")
+        if lb != -1 and rb != -1 and rb > lb:
+            candidates.append(text[lb : rb + 1])
+
+        # ── Attempt 4: extract first '{' ... last '}' substring (single obj)
+        lc, rc = text.find("{"), text.rfind("}")
+        if lc != -1 and rc != -1 and rc > lc:
+            candidates.append(text[lc : rc + 1])
+
+        for cand in candidates:
+            if not cand:
+                continue
+            try:
+                parsed = json.loads(cand)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(parsed, dict):
+                return [parsed]
+            if isinstance(parsed, list):
+                return parsed
+            # Some other JSON scalar — ignore
+            continue
+
+        # All attempts failed — log and return empty list (do NOT raise).
+        logger.warning(
+            "Could not parse JSON array from LLM response (returning []). Raw: %r",
+            raw[:500],
+        )
+        return []
 
     def _confidence_to_float(self, confidence: Any) -> float | None:
         """Normalize confidence to float in [0, 1]."""

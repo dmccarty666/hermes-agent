@@ -7,7 +7,6 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from hermes_memory_core.dream.report_writer import write_dream_report
 from hermes_memory_core.dream.worker import DreamWorker
 
 # Dedicated log file per Phase 1 conventions — separate from memory-*.log
@@ -59,13 +58,16 @@ if __name__ == "__main__":
     started_at = datetime.now(timezone.utc).isoformat()
     try:
         result = worker.dream(scope=args.scope, session_id=args.session_id)
-        ended_at = result.dream_run.completed_at or ""
-
-        report_path = write_dream_report(result, started_at, ended_at)
-        logger.info("Dream complete — report=%s facts=%d decisions=%d questions=%d",
-                    report_path, result.dream_run.facts_created,
-                    result.dream_run.decisions_created,
-                    result.dream_run.questions_created)
+        # DreamWorker._stage_record_dream_run already wrote the report to
+        # ~/.hermes/memory/dreams/YYYY-MM-DD-HHMM.md — don't double-write.
+        report_path = result.output_path or "(no report — empty scope)"
+        logger.info(
+            "Dream complete — report=%s facts=%d decisions=%d questions=%d",
+            report_path,
+            result.dream_run.facts_created,
+            result.dream_run.decisions_created,
+            result.dream_run.questions_created,
+        )
         sys.exit(0)
     except Exception as exc:
         logger.exception("Dreamer failed: %s", exc)

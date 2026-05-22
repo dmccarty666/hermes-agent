@@ -144,9 +144,8 @@ def test_scenario_K_migration_runs_without_error(migration_env, clean_hl_db):
     if not HL_DB.parent.exists():
         HL_DB.parent.mkdir(parents=True, exist_ok=True)
 
-    # Create the DB (it may be empty/incomplete — migration script should handle this)
-    # The migration script's migrate() function should call ensure_schema() first.
-    # If it doesn't, this test will fail, which correctly signals the gap.
+    # Create the DB (it may be empty/incomplete — migration script now handles this)
+    # The migration script calls ensure_schema() to create tables before querying.
     result = subprocess.run(
         [
             sys.executable,
@@ -159,9 +158,6 @@ def test_scenario_K_migration_runs_without_error(migration_env, clean_hl_db):
         env={**os.environ, "HERMES_HOME": str(Path.home() / ".hermes")},
     )
 
-    # Accept two outcomes:
-    # 1. Success (0) — migration handled missing schema gracefully
-    # 2. Error with "no such table" — migration script needs schema init (known gap)
     if result.returncode != 0:
         if "no such table" in result.stderr:
             pytest.fail(

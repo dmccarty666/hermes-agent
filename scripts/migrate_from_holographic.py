@@ -109,6 +109,47 @@ def compute_content_hash(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    """Create hermes-local schema if tables are missing."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS entities("
+        "entity_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "name TEXT UNIQUE NOT NULL,"
+        "entity_type TEXT DEFAULT 'unknown',"
+        "aliases TEXT DEFAULT '',"
+        "created_at TEXT"
+        ")"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS facts("
+        "fact_id TEXT PRIMARY KEY,"
+        "fact_text TEXT NOT NULL,"
+        "content_hash TEXT UNIQUE,"
+        "scope TEXT DEFAULT 'general',"
+        "category TEXT DEFAULT 'general',"
+        "trust_score REAL DEFAULT 0.5,"
+        "confidence REAL DEFAULT 0.5,"
+        "status TEXT DEFAULT 'active',"
+        "first_seen_at TEXT,"
+        "last_confirmed_at TEXT,"
+        "source_refs_json TEXT DEFAULT '[]',"
+        "tags_json TEXT DEFAULT '[]',"
+        "retrieval_count INTEGER DEFAULT 0,"
+        "helpful_count INTEGER DEFAULT 0,"
+        "created_at TEXT,"
+        "updated_at TEXT"
+        ")"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS fact_entities("
+        "fact_id TEXT,"
+        "entity_id INTEGER,"
+        "PRIMARY KEY (fact_id, entity_id)"
+        ")"
+    )
+    conn.commit()
+
+
 def introspect_table(conn: sqlite3.Connection, table: str) -> list[dict]:
     """Return column metadata for a table using PRAGMA table_info."""
     cur = conn.execute(f"PRAGMA table_info({table})")
@@ -142,6 +183,8 @@ def migrate(
     # ---- Connect to hermes-local (read-write) ----
     hl_conn = sqlite3.connect(str(hl_db))
     hl_conn.row_factory = sqlite3.Row
+    # Ensure schema exists before querying
+    ensure_schema(hl_conn)
     # Ensure WAL for safety on networked filesystems
     try:
         hl_conn.execute("PRAGMA journal_mode=WAL")

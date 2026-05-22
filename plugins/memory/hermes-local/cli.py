@@ -96,14 +96,15 @@ def _health() -> str:
 
     # Redaction
     try:
-        from hermes_memory_core.write.redaction import Redactor
+        from hermes_memory_core.write.redaction import redact
 
-        scanner = Redactor()
         # Realistic AWS key format: AKIA prefix + exactly 16 uppercase alphanumeric
-        result = scanner.scan("test_AKIAIOSFODNN7EXAMPLEX_test")
-        if result.fired:
-            types_seen = sorted({h.pattern_name for h in result.hits})
-            lines.append(f"redaction    : available ({len(types_seen)} types: {', '.join(types_seen)})")
+        result = redact("test AKIAIOSFODNN7EXAMPLE test")
+        if result.types_found:
+            lines.append(
+                f"redaction    : available ({len(result.types_found)} types: "
+                f"{', '.join(sorted(result.types_found))})"
+            )
         else:
             lines.append("redaction    : scan not working — no hits on test content")
     except Exception as e:

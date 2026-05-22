@@ -905,6 +905,42 @@ class MemoryDB(MemoryStore):
         """Apply the full schema (idempotent). Use this instead of lazy init."""
         self._ensure_init_full_schema()
 
+    def is_initialized(self) -> bool:
+        """Return True if the full schema has been applied to this DB.
+
+        Checks for the presence of the ``facts`` table as a proxy for "schema
+        present" — that table is created by ``_ensure_init_full_schema`` and
+        is required by every search/write path.
+
+        This is a read-only check and works even when the DB has not been
+        explicitly connected: if ``_conn`` is None we open a short-lived
+        connection just for the schema introspection and close it again.
+        """
+        import sqlite3
+        # Use the live connection when present (cheap, no setup cost).
+        if self._conn is not None:
+            try:
+                cur = self._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='facts'"
+                )
+                return cur.fetchone() is not None
+            except Exception:
+                return False
+        # Otherwise probe the file directly without mutating instance state.
+        if not Path(self._db_path).exists():
+            return False
+        try:
+            tmp = sqlite3.connect(str(self._db_path))
+            try:
+                cur = tmp.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='facts'"
+                )
+                return cur.fetchone() is not None
+            finally:
+                tmp.close()
+        except Exception:
+            return False
+
     def _ensure_init_full_schema(self) -> None:
         """Initialize with _FULL_SCHEMA (thread-safe, idempotent)."""
         if self._initialized:

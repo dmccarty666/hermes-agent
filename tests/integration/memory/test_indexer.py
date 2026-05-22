@@ -11,6 +11,32 @@ Uses real Qdrant (:6333) and real LMS (:1235) when available.
 Test collection suffix _test ensures clean teardown.
 """
 
+# ── PHASE-1.5 TRIAGE — NEEDS ISOLATED QDRANT ───────────────────────────────────
+# Triaged Bucket A by the recovery pass on branch recovery/phase-1-5-restore.
+# Tests want their own isolated Qdrant collection and ECONNREFUSE when nothing
+# is listening on :6333. The live system's :6333 is NOT to be repurposed —
+# see docs/INTEGRATION-TEST-TRIAGE.md for how to spin up a transient test
+# instance on a non-conflicting port and unskip.
+import os as _phase15_os
+import socket as _phase15_socket
+import pytest as _phase15_pytest
+
+def _phase15_qdrant_reachable() -> bool:
+    host = _phase15_os.environ.get("QDRANT_HOST", "localhost")
+    port = int(_phase15_os.environ.get("QDRANT_PORT", "6333"))
+    try:
+        with _phase15_socket.create_connection((host, port), timeout=0.2):
+            return True
+    except OSError:
+        return False
+
+if not _phase15_qdrant_reachable():
+    _phase15_pytest.skip(
+        "needs isolated Qdrant; see docs/INTEGRATION-TEST-TRIAGE.md",
+        allow_module_level=True,
+    )
+
+
 import json
 import time
 import uuid

@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>hermes-local memory — HyperFrames showcase</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<div class="stage" id="stage" data-composition-id="hermes-memory" data-width="1920" data-height="1080" data-start="0" data-duration="75">
+
+  <!-- =============== FRAME 1: THE PROBLEM =============== -->
+  <section class="frame" data-frame="problem" data-duration="6" data-enter="fade" data-exit="slide">
+    <div class="bg-grid"></div>
+    <div class="frame-inner">
+      <div class="orb-stack">
+        <div class="orb orb-llm">
+          <div class="orb-core"></div>
+          <div class="orb-ring"></div>
+          <div class="orb-label">LLM</div>
+        </div>
+        <div class="thoughts">
+          <div class="thought t1">"my name is David"</div>
+          <div class="thought t2">"i prefer concise replies"</div>
+          <div class="thought t3">"yesterday we discussed Qdrant"</div>
+          <div class="thought t4">"book launch is Nov 14"</div>
+        </div>
+      </div>
+      <div class="caption">
+        <div class="caption-eyebrow">01 · the problem</div>
+        <div class="caption-title">Without memory, every conversation starts from scratch.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- =============== FRAME 2: THE CAPTURE =============== -->
+  <section class="frame" data-frame="capture" data-duration="10" data-enter="slide" data-exit="slide">
+    <div class="bg-grid"></div>
+    <div class="frame-inner">
+      <div class="capture-stage">
+        <div class="chat-stream">
+          <div class="bubble bubble-user b1">user: my doctor is Dr. <span class="pii">Singh</span></div>
+          <div class="bubble bubble-asst b2">asst: noted — Dr. ⟨name⟩</div>
+          <div class="bubble bubble-user b3">user: schedule for Tue, ph: <span class="pii">555-0142</span></div>
+          <div class="bubble bubble-asst b4">asst: ⟨phone⟩ redacted, scheduled</div>
+          <div class="bubble bubble-user b5">user: also email <span class="pii">d@nous.ai</span></div>
+        </div>
+        <div class="flow-arrow">
+          <svg viewBox="0 0 200 60" preserveAspectRatio="none">
+            <defs>
+              <linearGradient id="flowGrad" x1="0" y1="0" x2="1" y2="0">
+                <stop offset="0%" stop-color="#5eead4" stop-opacity="0"/>
+                <stop offset="50%" stop-color="#5eead4" stop-opacity="1"/>
+                <stop offset="100%" stop-color="#fbbf24" stop-opacity="0"/>
+              </linearGradient>
+            </defs>
+            <path d="M 0 30 L 200 30" stroke="url(#flowGrad)" stroke-width="2" fill="none"/>
+          </svg>
+        </div>
+        <div class="db-icon">
+          <div class="db-cyl db-cyl-1"></div>
+          <div class="db-cyl db-cyl-2"></div>
+          <div class="db-cyl db-cyl-3"></div>
+          <div class="db-label">turns.jsonl</div>
+        </div>
+      </div>
+      <div class="caption">
+        <div class="caption-eyebrow">02 · capture</div>
+        <div class="caption-title">Every turn is captured — losslessly, with PII redaction.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- =============== FRAME 3: THE DREAMER =============== -->
+  <section class="frame" data-frame="dreamer" data-duration="12" data-enter="fade" data-exit="fade">
+    <div class="bg-grid bg-night"></div>
+    <div class="stars" id="stars"></div>
+    <div class="frame-inner">
+      <div class="dreamer-stage">
+        <div class="moon">
+          <div class="moon-glow"></div>
+          <div class="moon-body"></div>
+        </div>
+        <div class="clock">
+          <div class="clock-face">
+            <div class="clock-time">03:00</div>
+            <div class="clock-label">nightly</div>
+          </div>
+        </div>
+        <div class="brain">
+          <div class="brain-core">
+            <div class="brain-label">Qwen3</div>
+            <div class="brain-sub">dreamer</div>
+          </div>
+          <div class="brain-pulse"></div>
+        </div>
+        <div class="cards">
+          <div class="card card-fact c1"><span class="card-tag">FACT</span>doctor.name = Dr. ⟨name⟩</div>
+          <div class="card card-decision c2"><span class="card-tag">DECISION</span>use concise replies</div>
+          <div class="card card-open c3"><span class="card-tag">OPEN</span>book launch venue?</div>
+          <div class="card card-fact c4"><span class="card-tag">FACT</span>prefers Qdrant over pgvector</div>
+        </div>
+      </div>
+      <div class="caption">
+        <div class="caption-eyebrow">03 · the dreamer</div>
+        <div class="caption-title">Each night, a separate LLM extracts structured knowledge.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- =============== FRAME 4: STORAGE TIERS =============== -->
+  <section class="frame" data-frame="storage" data-duration="10" data-enter="slide" data-exit="slide">
+    <div class="bg-grid"></div>
+    <div class="frame-inner">
+      <div class="storage-stage">
+        <div class="storage-source">
+          <div class="src-card">
+            <span class="card-tag">FACT</span>
+            doctor.name = Dr. ⟨name⟩
+          </div>
+        </div>
+        <div class="storage-fanout">
+          <svg viewBox="0 0 400 200" preserveAspectRatio="none">
+            <path d="M 200 10 Q 80 100 80 190" class="fan-line fl1" />
+            <path d="M 200 10 L 200 190" class="fan-line fl2" />
+            <path d="M 200 10 Q 320 100 320 190" class="fan-line fl3" />
+          </svg>
+        </div>
+        <div class="storage-tiers">
+          <div class="tier tier-sqlite">
+            <div class="tier-head">SQLite</div>
+            <div class="tier-sub">structured rows</div>
+            <div class="tier-viz">
+              <div class="row-grid">
+                <div class="row-cell">id</div><div class="row-cell">key</div><div class="row-cell">val</div>
+                <div class="row-cell">84</div><div class="row-cell">doctor.name</div><div class="row-cell">Dr ⟨n⟩</div>
+                <div class="row-cell">85</div><div class="row-cell">pref.tone</div><div class="row-cell">concise</div>
+              </div>
+            </div>
+          </div>
+          <div class="tier tier-qdrant">
+            <div class="tier-head">Qdrant</div>
+            <div class="tier-sub">semantic vectors</div>
+            <div class="tier-viz">
+              <div class="vec-space">
+                <div class="vec-dot vd1"></div>
+                <div class="vec-dot vd2"></div>
+                <div class="vec-dot vd3"></div>
+                <div class="vec-dot vd4"></div>
+                <div class="vec-dot vd5"></div>
+                <div class="vec-dot vd6 active"></div>
+              </div>
+            </div>
+          </div>
+          <div class="tier tier-jsonl">
+            <div class="tier-head">JSONL</div>
+            <div class="tier-sub">raw event log</div>
+            <div class="tier-viz">
+              <div class="jsonl-lines">
+                <div class="jl">{"ts":"03:00","kind":"fact",…}</div>
+                <div class="jl">{"ts":"03:01","kind":"dec",…}</div>
+                <div class="jl">{"ts":"03:02","kind":"open",…}</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="caption">
+        <div class="caption-eyebrow">04 · storage</div>
+        <div class="caption-title">Stored three ways: structured rows, semantic vectors, raw events.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- =============== FRAME 5: THE RETRIEVAL =============== -->
+  <section class="frame" data-frame="retrieval" data-duration="12" data-enter="fade" data-exit="fade">
+    <div class="bg-grid"></div>
+    <div class="frame-inner">
+      <div class="retrieval-stage">
+        <div class="query-card">
+          <div class="query-prompt">user:</div>
+          <div class="query-text">"what did we decide about Qdrant?"</div>
+        </div>
+        <div class="splitter">
+          <svg viewBox="0 0 500 120" preserveAspectRatio="none">
+            <path d="M 250 0 Q 60 60 60 120" class="split-line sl1"/>
+            <path d="M 250 0 Q 180 60 185 120" class="split-line sl2"/>
+            <path d="M 250 0 Q 320 60 315 120" class="split-line sl3"/>
+            <path d="M 250 0 Q 440 60 440 120" class="split-line sl4"/>
+          </svg>
+        </div>
+        <div class="backends">
+          <div class="backend be-keyword">
+            <div class="be-name">keyword</div>
+            <div class="be-engine">FTS5</div>
+            <div class="be-score">0.81</div>
+          </div>
+          <div class="backend be-semantic">
+            <div class="be-name">semantic</div>
+            <div class="be-engine">Qdrant</div>
+            <div class="be-score">0.92</div>
+          </div>
+          <div class="backend be-structural">
+            <div class="be-name">structural</div>
+            <div class="be-engine">HRR</div>
+            <div class="be-score">0.74</div>
+          </div>
+          <div class="backend be-recency">
+            <div class="be-name">recency</div>
+            <div class="be-engine">Jaccard</div>
+            <div class="be-score">0.66</div>
+          </div>
+        </div>
+        <div class="merger">
+          <svg viewBox="0 0 500 80" preserveAspectRatio="none">
+            <path d="M 60 0 Q 250 40 250 80" class="split-line sl1"/>
+            <path d="M 185 0 Q 250 40 250 80" class="split-line sl2"/>
+            <path d="M 315 0 Q 250 40 250 80" class="split-line sl3"/>
+            <path d="M 440 0 Q 250 40 250 80" class="split-line sl4"/>
+          </svg>
+        </div>
+        <div class="results">
+          <div class="result-row r1"><span class="rank">#1</span> prefers Qdrant over pgvector <span class="conf">0.94</span></div>
+          <div class="result-row r2"><span class="rank">#2</span> Qdrant collection: hermes_facts <span class="conf">0.88</span></div>
+          <div class="result-row r3"><span class="rank">#3</span> embedding model = nomic-embed <span class="conf">0.71</span></div>
+        </div>
+      </div>
+      <div class="caption">
+        <div class="caption-eyebrow">05 · retrieval</div>
+        <div class="caption-title">Hybrid retrieval: 4 backends, weighted merge, ranked output.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- =============== FRAME 6: THE LOOP CLOSES =============== -->
+  <section class="frame" data-frame="loop" data-duration="8" data-enter="slide" data-exit="slide">
+    <div class="bg-grid"></div>
+    <div class="frame-inner">
+      <div class="loop-stage">
+        <div class="loop-results">
+          <div class="result-mini">prefers Qdrant over pgvector</div>
+          <div class="result-mini">collection: hermes_facts</div>
+          <div class="result-mini">tone: concise</div>
+        </div>
+        <div class="loop-arrow">
+          <svg viewBox="0 0 200 40">
+            <defs>
+              <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="#5eead4"/>
+              </marker>
+            </defs>
+            <path d="M 5 20 L 190 20" stroke="#5eead4" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+          </svg>
+        </div>
+        <div class="orb orb-remembered">
+          <div class="orb-core orb-core-bright"></div>
+          <div class="orb-ring"></div>
+          <div class="orb-label">LLM</div>
+          <div class="orb-thought">
+            <div class="ot-line">∙ Qdrant chosen</div>
+            <div class="ot-line">∙ keep replies concise</div>
+            <div class="ot-line">∙ ⟨name⟩ redacted</div>
+          </div>
+        </div>
+      </div>
+      <div class="caption">
+        <div class="caption-eyebrow">06 · loop closes</div>
+        <div class="caption-title">The model now remembers — not as a transcript, but as structured knowledge.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- =============== FRAME 7: THE STACK =============== -->
+  <section class="frame" data-frame="stack" data-duration="10" data-enter="fade" data-exit="fade">
+    <div class="bg-grid"></div>
+    <div class="frame-inner">
+      <div class="stack-stage">
+        <div class="arch-grid">
+          <div class="node node-provider">
+            <div class="node-title">Provider Plugin</div>
+            <div class="node-sub">hermes-agent</div>
+          </div>
+          <div class="node node-memdb">
+            <div class="node-title">MemoryDB</div>
+            <div class="node-sub">SQLite + FTS5</div>
+          </div>
+          <div class="node node-qdrant">
+            <div class="node-title">Qdrant</div>
+            <div class="node-sub">vector store</div>
+          </div>
+          <div class="node node-lms">
+            <div class="node-title">LM Studio</div>
+            <div class="node-sub">embeddings</div>
+          </div>
+          <div class="node node-dreamer">
+            <div class="node-title">Dreamer</div>
+            <div class="node-sub">nightly cron · 03:00</div>
+          </div>
+          <div class="node node-retriever">
+            <div class="node-title">Retriever</div>
+            <div class="node-sub">hybrid · 4 backends</div>
+          </div>
+          <svg class="arch-edges" viewBox="0 0 600 360" preserveAspectRatio="none">
+            <path d="M 100 60 L 300 60" class="edge"/>
+            <path d="M 300 60 L 500 60" class="edge"/>
+            <path d="M 300 60 L 300 200" class="edge"/>
+            <path d="M 500 60 L 500 200" class="edge"/>
+            <path d="M 100 200 L 300 200" class="edge"/>
+            <path d="M 300 200 L 500 200" class="edge"/>
+            <path d="M 100 60 L 100 200" class="edge"/>
+          </svg>
+        </div>
+        <div class="badge-row">
+          <div class="badge">all local</div>
+          <div class="badge">no external api</div>
+          <div class="badge">zero per-token cost</div>
+        </div>
+      </div>
+      <div class="caption">
+        <div class="caption-eyebrow">07 · the stack</div>
+        <div class="caption-title">All local. No external API. Zero per-token charge.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- =============== FRAME 8: THE NUMBERS =============== -->
+  <section class="frame" data-frame="numbers" data-duration="7" data-enter="fade" data-exit="fade">
+    <div class="bg-grid"></div>
+    <div class="frame-inner">
+      <div class="numbers-stage">
+        <div class="numbers-grid">
+          <div class="num-card">
+            <div class="num-label">Facts extracted</div>
+            <div class="num-value" data-target="84">0</div>
+          </div>
+          <div class="num-card">
+            <div class="num-label">Sessions</div>
+            <div class="num-value" data-target="6">0</div>
+          </div>
+          <div class="num-card">
+            <div class="num-label">Chunks indexed</div>
+            <div class="num-value" data-target="9">0</div>
+          </div>
+          <div class="num-card">
+            <div class="num-label">Facts in Qdrant</div>
+            <div class="num-value" data-target="76">0</div>
+          </div>
+        </div>
+        <div class="cadence">
+          <span class="cadence-dot"></span> dream runs · nightly @ 03:00
+        </div>
+      </div>
+      <div class="caption">
+        <div class="caption-eyebrow">08 · live</div>
+        <div class="caption-title">Running on David's box, right now.</div>
+      </div>
+    </div>
+  </section>
+
+</div>
+
+<!-- HUD -->
+<div class="hud">
+  <div class="hud-brand">hermes-local · memory</div>
+  <div class="hud-progress">
+    <div class="hud-bar" id="hudBar"></div>
+  </div>
+  <div class="hud-frame" id="hudFrame">01 / 08</div>
+</div>
+
+<!-- Controls (subtle) -->
+<div class="controls">
+  <button class="ctrl" id="btnPrev" aria-label="previous">‹</button>
+  <button class="ctrl" id="btnPlay" aria-label="play/pause">⏸</button>
+  <button class="ctrl" id="btnNext" aria-label="next">›</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/gsap.min.js"></script>
+<script>
+  // HyperFrames runtime registry — script.js attaches the real timeline,
+  // but expose the keyed slot up-front so static linters can find it.
+  window.__timelines = window.__timelines || {};
+  window.__timelines["hermes-memory"] = null;
+</script>
+<script src="script.js"></script>
+</body>
+</html>

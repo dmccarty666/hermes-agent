@@ -356,12 +356,12 @@ def _ls_sessions(rest: str) -> str:
         conn.execute("PRAGMA synchronous = NORMAL")
         try:
             cur = conn.execute(
-                """SELECT session_id, agent, project, started_at,
-                          COUNT(turn_id) as turn_count, ended_at
-                   FROM sessions
-                   LEFT JOIN turns USING(session_id)
-                   GROUP BY session_id
-                   ORDER BY started_at DESC
+                """SELECT s.session_id, s.agent, s.project, s.started_at,
+                          COUNT(t.turn_id) as turn_count, s.ended_at
+                   FROM sessions s
+                   LEFT JOIN turns t ON t.session_id = s.session_id
+                   GROUP BY s.session_id
+                   ORDER BY s.started_at DESC
                    LIMIT 50"""
             )
             rows = cur.fetchall()

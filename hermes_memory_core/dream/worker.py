@@ -12,9 +12,17 @@ Stages:
   8. update_project_memory — update project .md files
   9. record_dream_run  — write dream report, mark turns dreamed
 
-All LLM calls use the LMS endpoint (Qwen3.6-35B @ 192.168.2.105:1234)
-with json_mode=true. All candidate writes go through write_memory()
-(not direct DB inserts).
+Embedding endpoint: localhost:1235 (local LMStudio only — no cross-host GPU contention)
+LLM inference: Spark2 GPU node (DREAM_LLM_URL @ 192.168.2.105:1234, Qwen3.6-35B)
+All candidate writes go through write_memory() (not direct DB inserts).
+
+Key runtime guards (2026-05-23):
+  _DREAMER_SEMAPHORE (threading.Semaphore(1)) — single-threaded dreamer enforcement
+  LMS_TIMEOUT = 300s (was 240s)
+  MAX_LLM_RETRIES = 2, RETRY_BASE_DELAY = 5s (exponential backoff)
+  LLMTimeout exception for explicit timeout handling; all 5 call sites use
+  _llm_complete_with_retry with graceful degradation (empty [] / fail string on timeout)
+  Post-pass retry loop: failed session IDs queued and retried after main pass.
 """
 
 from __future__ import annotations
@@ -85,8 +93,14 @@ PROJECTS_DIR = Path(HERMES_HOME) / "memory" / "projects"
 
 DREAM_LLM_URL     = "http://192.168.2.105:1234/v1"
 DREAM_LLM_MODEL   = "qwen3.6-35b-instruct"
-LMS_TIMEOUT       = 240.0
+LMS_TIMEOUT       = 300.0
+MAX_LLM_RETRIES   = 2
+RETRY_BASE_DELAY = 5.0
 TEMPERATURE       = 0.0
+
+# Single-process lock: only ONE dreamer runs at a time across all workers.
+import threading
+_DREAMER_SEMAPHORE = threading.Semaphore(1)
 # 4096 was truncating fact-extraction JSON mid-array on 3+ turn sessions,
 # producing un-parseable output. 8192 leaves comfortable headroom.
 MAX_TOKENS        = 8192
@@ -102,6 +116,37 @@ def _date_now() -> str:
 
 # ── LLM call ─────────────────────────────────────────────────────────────────
 
+class LLMTimeout(Exception):
+    """Raised when the dreamer LLM times out during extraction."""
+    pass
+
+def _llm_complete_with_retry(
+    prompt: str,
+    system: str | None = None,
+    json_mode: bool = True,
+    temperature: float = TEMPERATURE,
+    max_tokens: int = MAX_TOKENS,
+) -> str:
+    """Call _llm_complete with exponential-backoff retry on LLMTimeout."""
+    last_exc: Exception | None = None
+    for attempt in range(MAX_LLM_RETRIES):
+        try:
+            return _llm_complete(
+                prompt, system=system, json_mode=json_mode,
+                temperature=temperature, max_tokens=max_tokens,
+            )
+        except LLMTimeout as exc:
+            last_exc = exc
+            if attempt < MAX_LLM_RETRIES - 1:
+                import time
+                delay = RETRY_BASE_DELAY * (2 ** attempt)
+                logger.warning(
+                    "LLMTimeout (attempt %d/%d) -- retrying in %.1fs",
+                    attempt + 1, MAX_LLM_RETRIES, delay,
+                )
+                time.sleep(delay)
+    raise last_exc  # type: ignore[arg-type]
+
 def _llm_complete(
     prompt: str,
     system: str | None = None,
@@ -109,14 +154,17 @@ def _llm_complete(
     temperature: float = TEMPERATURE,
     max_tokens: int = MAX_TOKENS,
 ) -> str:
-    """Call the dreamer LLM via LMS OpenAI-compatible API."""
+    """Call the dreamer LLM via LMS OpenAI-compatible API.
+
+    ReadTimeout is caught and re-raised as LLMTimeout so callers can
+    distinguish timeouts from other HTTP errors.
+    """
     import requests
 
     messages: List[Dict[str, str]] = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
-
     payload: Dict[str, Any] = {
         "model": DREAM_LLM_MODEL,
         "messages": messages,
@@ -126,12 +174,16 @@ def _llm_complete(
     if json_mode:
         payload["extra_body"] = {"json_mode": True}
 
-    response = requests.post(
-        f"{DREAM_LLM_URL}/chat/completions",
-        json=payload,
-        headers={"Content-Type": "application/json"},
-        timeout=LMS_TIMEOUT,
-    )
+    try:
+        response = requests.post(
+            f"{DREAM_LLM_URL}/chat/completions",
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=LMS_TIMEOUT,
+        )
+    except requests.exceptions.ReadTimeout as exc:
+        raise LLMTimeout(f"ReadTimeout after {LMS_TIMEOUT}s: {exc}") from exc
+
     if response.status_code != 200:
         raise RuntimeError(
             f"LLM returned {response.status_code}: {response.text[:300]}"
@@ -301,6 +353,29 @@ class DreamWorker:
         Returns:
             dict with run statistics and output path
         """
+        # Cross-run semaphore: only ONE dreamer runs at a time.
+        acquired = _DREAMER_SEMAPHORE.acquire(timeout=300)
+        if not acquired:
+            logger.warning(
+                "Could not acquire _DREAMER_SEMAPHORE -- another dreamer is "
+                "running. Bailing out quietly."
+            )
+            return {"dream_run_id": "", "status": "skipped",
+                    "errors": ["semaphore_timeout"]}
+
+        try:
+            return self._run_inner(scope, date, project, session_id)
+        finally:
+            _DREAMER_SEMAPHORE.release()
+
+    def _run_inner(
+        self,
+        scope: str,
+        date: str | None,
+        project: str | None,
+        session_id: str | None,
+    ) -> Dict[str, Any]:
+        """Inner run body (called after semaphore is acquired)."""
         self._dream_run_id = f"dr:{uuid.uuid4().hex[:16]}"
         self._started_at = _utc_now()
         self._scope_input = json.dumps({"scope": scope, "date": date, "project": project})
@@ -310,15 +385,14 @@ class DreamWorker:
         self._decisions_created = 0
         self._questions_created = 0
         self._contradictions_detected = 0
+        self._failed_session_ids: List[str] = []
 
         logger.info(
             "DreamWorker.run started: dream_run_id=%s scope=%s",
             self._dream_run_id, scope,
         )
 
-        # Insert the dream_runs row up front (status='running') so the UPDATE
-        # in complete_dream_run() has something to land on. Without this the
-        # dream_runs table stays empty forever.
+        # Insert the dream_runs row up front (status='running')
         try:
             self.store.create_dream_run(
                 dream_run_id=self._dream_run_id,
@@ -327,8 +401,6 @@ class DreamWorker:
                 llm_endpoint=DREAM_LLM_URL,
             )
         except Exception as exc:
-            # Don't kill the run — log and continue. complete_dream_run's UPDATE
-            # will simply no-op, matching prior (broken) behavior.
             logger.warning("create_dream_run failed (continuing): %s", exc)
 
         try:
@@ -354,23 +426,42 @@ class DreamWorker:
             session_groups = self._stage_group_by_session(turns)
             logger.info("Stage 2 done: %d session groups", len(session_groups))
 
-            # Stages 3-6: LLM extraction per session
+            # Stages 3-6: LLM extraction per session -- sequential, graceful degradation
             all_facts: List[Dict[str, Any]] = []
             all_decisions: List[Dict[str, Any]] = []
             all_questions: List[Dict[str, Any]] = []
 
-            for session_id, session_turns in session_groups.items():
-                try:
-                    f, d, q = self._process_session(session_id, session_turns)
-                    all_facts.extend(f)
-                    all_decisions.extend(d)
-                    all_questions.extend(q)
-                except Exception as exc:
-                    logger.exception("Session %s failed: %s", session_id, exc)
-                    self._errors.append(f"session {session_id}: {exc}")
-                    # Mark this session's turns as failed
-                    turn_ids = [t["turn_id"] for t in session_turns]
-                    self.store.update_turns_dream_status(turn_ids, "failed")
+            for sid, s_turns in session_groups.items():
+                f, d, q = self._process_session(sid, s_turns)
+                all_facts.extend(f)
+                all_decisions.extend(d)
+                all_questions.extend(q)
+
+            # -- Post-pass retry for LLMTimeout sessions -------------------------------
+            if self._failed_session_ids:
+                retry_facts: List[Dict[str, Any]] = []
+                retry_decisions: List[Dict[str, Any]] = []
+                retry_questions: List[Dict[str, Any]] = []
+                for sid in list(self._failed_session_ids):
+                    s_turns = session_groups.get(sid, [])
+                    if not s_turns:
+                        continue
+                    logger.info("Retrying LLMTimeout session %s (attempt 2/2)", sid)
+                    f, d, q = self._process_session(sid, s_turns)
+                    retry_facts.extend(f)
+                    retry_decisions.extend(d)
+                    retry_questions.extend(q)
+                    if sid in self._failed_session_ids:
+                        self._failed_session_ids.remove(sid)
+                all_facts.extend(retry_facts)
+                all_decisions.extend(retry_decisions)
+                all_questions.extend(retry_questions)
+                logger.info(
+                    "Post-pass retry done: %d retry facts, %d retry decisions, "
+                    "%d retry questions",
+                    len(retry_facts), len(retry_decisions), len(retry_questions),
+                )
+            # -- End post-pass retry ------------------------------------------------
 
             logger.info(
                 "Stages 3-6 done: %d facts, %d decisions, %d questions extracted",
@@ -574,7 +665,13 @@ class DreamWorker:
         conversation_str = _render_conversation(turns)
         prompt = template.replace("{{conversation}}", conversation_str)
         try:
-            return _llm_complete(prompt, system="You are a session summarizer. Produce a concise, structured summary.")
+            return _llm_complete_with_retry(
+                prompt,
+                system="You are a session summarizer. Produce a concise, structured summary.",
+            )
+        except LLMTimeout:
+            logger.warning("summarize_session LLMTimeout for session %s", session_id)
+            return "SUMMARIZATION_FAILED: LLMTimeout"
         except Exception as exc:
             return f"SUMMARIZATION_FAILED: {exc}"
 
@@ -663,8 +760,8 @@ class DreamWorker:
             return []
 
         try:
-            # Use _llm_complete for the raw string output (returns text, not json)
-            raw = _llm_complete(
+            # Use _llm_complete_with_retry for the raw string output (returns text, not json)
+            raw = _llm_complete_with_retry(
                 json.dumps({
                     "new_facts": all_facts,
                     "existing_facts": [f.get("fact_text", "") if isinstance(f, dict) else str(f) for f in existing],
@@ -672,6 +769,9 @@ class DreamWorker:
                 system="You are a contradiction detector. Return a JSON list of conflicts, each with fact_a, fact_b, conflict_type, resolution.",
             )
             return self._parse_json_array(raw)
+        except LLMTimeout:
+            logger.warning("detect_contradictions LLMTimeout -- graceful degradation")
+            return []
         except Exception:
             return []
 
@@ -794,15 +894,42 @@ class DreamWorker:
         Run stages 3-6 for a single session:
         summarize -> extract facts -> extract decisions -> extract questions.
         Returns (facts, decisions, questions).
+
+        Graceful degradation: if any extraction stage raises LLMTimeout,
+        the session is appended to _failed_session_ids for post-pass retry.
+        Other stages still run.  Unexpected exceptions propagate.
         """
-        # Build conversation for prompts
         conversation_str = _render_conversation(session_turns)
 
-        facts = self._extract_facts(session_id, session_turns, conversation_str)
-        decisions = self._extract_decisions(session_id, session_turns, conversation_str)
-        questions = self._extract_questions(session_id, session_turns, conversation_str)
+        facts: List[Dict[str, Any]] = []
+        decisions: List[Dict[str, Any]] = []
+        questions: List[Dict[str, Any]] = []
+
+        for label, extract_fn in [
+            ("facts",     lambda: self._extract_facts(session_id, session_turns, conversation_str)),
+            ("decisions", lambda: self._extract_decisions(session_id, session_turns, conversation_str)),
+            ("questions", lambda: self._extract_questions(session_id, session_turns, conversation_str)),
+        ]:
+            try:
+                result = extract_fn()
+                if label == "facts":
+                    facts = result
+                elif label == "decisions":
+                    decisions = result
+                else:
+                    questions = result
+            except LLMTimeout:
+                # Already logged in _extract_*; record for post-pass retry
+                if session_id not in self._failed_session_ids:
+                    self._failed_session_ids.append(session_id)
+            except Exception as exc:
+                logger.exception("Session %s extraction '%s' unexpected error: %s",
+                                session_id, label, exc)
+                raise
 
         return facts, decisions, questions
+
+
 
     def _extract_facts(
         self,
@@ -820,13 +947,24 @@ class DreamWorker:
         prompt += f"\n\nSession ID: {session_id}"
 
         try:
-            raw = _llm_complete(prompt, json_mode=True)
+            raw = _llm_complete_with_retry(prompt, json_mode=True)
             # Parse JSON array
             items = self._parse_json_array(raw)
+        except LLMTimeout:
+            # Retry exhausted -- session queued for post-pass retry.
+            # Graceful degradation: pipeline continues with other stages.
+            logger.warning(
+                "extract__extract_facts LLMTimeout for session %s -- session queued for post-pass retry",
+                session_id,
+            )
+            self._errors.append(f"extract__extract_facts {session_id}: LLMTimeout (retried)")
+            if session_id not in self._failed_session_ids:
+                self._failed_session_ids.append(session_id)
+            return []
         except Exception as exc:
-            logger.warning("extract_facts failed for session %s: %s", session_id, exc)
-            self._errors.append(f"extract_facts {session_id}: {exc}")
-            raise  # propagate to _process_session to mark turns as failed
+            logger.warning("extract__extract_facts failed for session %s: %s", session_id, exc)
+            self._errors.append(f"extract__extract_facts {session_id}: {exc}")
+            raise  # unexpected -- propagate to _process_session
 
         facts: List[Dict[str, Any]] = []
         for item in items:
@@ -895,12 +1033,23 @@ class DreamWorker:
         prompt += f"\n\nSession ID: {session_id}"
 
         try:
-            raw = _llm_complete(prompt, json_mode=True)
+            raw = _llm_complete_with_retry(prompt, json_mode=True)
             items = self._parse_json_array(raw)
+        except LLMTimeout:
+            # Retry exhausted -- session queued for post-pass retry.
+            # Graceful degradation: pipeline continues with other stages.
+            logger.warning(
+                "extract__extract_decisions LLMTimeout for session %s -- session queued for post-pass retry",
+                session_id,
+            )
+            self._errors.append(f"extract__extract_decisions {session_id}: LLMTimeout (retried)")
+            if session_id not in self._failed_session_ids:
+                self._failed_session_ids.append(session_id)
+            return []
         except Exception as exc:
-            logger.warning("extract_decisions failed for session %s: %s", session_id, exc)
-            self._errors.append(f"extract_decisions {session_id}: {exc}")
-            raise  # propagate to _process_session to mark turns as failed
+            logger.warning("extract__extract_decisions failed for session %s: %s", session_id, exc)
+            self._errors.append(f"extract__extract_decisions {session_id}: {exc}")
+            raise  # unexpected -- propagate to _process_session
 
         decisions: List[Dict[str, Any]] = []
         for item in items:
@@ -954,12 +1103,23 @@ class DreamWorker:
         prompt += f"\n\nSession ID: {session_id}"
 
         try:
-            raw = _llm_complete(prompt, json_mode=True)
+            raw = _llm_complete_with_retry(prompt, json_mode=True)
             items = self._parse_json_array(raw)
+        except LLMTimeout:
+            # Retry exhausted -- session queued for post-pass retry.
+            # Graceful degradation: pipeline continues with other stages.
+            logger.warning(
+                "extract__extract_questions LLMTimeout for session %s -- session queued for post-pass retry",
+                session_id,
+            )
+            self._errors.append(f"extract__extract_questions {session_id}: LLMTimeout (retried)")
+            if session_id not in self._failed_session_ids:
+                self._failed_session_ids.append(session_id)
+            return []
         except Exception as exc:
-            logger.warning("extract_questions failed for session %s: %s", session_id, exc)
-            self._errors.append(f"extract_questions {session_id}: {exc}")
-            raise  # propagate to _process_session to mark turns as failed
+            logger.warning("extract__extract_questions failed for session %s: %s", session_id, exc)
+            self._errors.append(f"extract__extract_questions {session_id}: {exc}")
+            raise  # unexpected -- propagate to _process_session
 
         questions: List[Dict[str, Any]] = []
         for item in items:

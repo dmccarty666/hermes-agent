@@ -22,7 +22,9 @@ from typing import Any, TypedDict
 import requests
 
 # Default endpoints
-DEFAULT_EMBEDDING_ENDPOINT = "http://192.168.2.105:1235"
+# Embeddings run on LOCAL LMStudio — eliminates cross-host GPU contention
+DEFAULT_EMBEDDING_ENDPOINT = "http://localhost:1235"
+# LLM inference runs on Spark2 GPU machine
 DEFAULT_LLM_ENDPOINT = "http://192.168.2.105:1234"
 
 
@@ -45,6 +47,7 @@ class EmbeddingHealth(TypedDict, total=False):
     status: str
     endpoint: str
     model: str
+    dimension: int | None
     message: str
 
 
@@ -52,6 +55,7 @@ class LLMHealth(TypedDict, total=False):
     status: str
     endpoint: str
     model: str
+    latency_ms: float | None
     message: str
 
 
@@ -145,25 +149,47 @@ def check_embedding(endpoint: str, timeout: int = 5) -> EmbeddingHealth:
         timeout: Request timeout in seconds.
 
     Returns:
-        EmbeddingHealth dict with status, endpoint, model.
+        EmbeddingHealth dict with status, endpoint, model, dimension.
     """
     result: EmbeddingHealth = {
         "status": "error",
         "endpoint": endpoint,
         "model": "unknown",
+        "dimension": None,
     }
     try:
+        import time as _time
+        start = _time.monotonic()
         # LMS OpenAI-compatible /v1/models endpoint
         for path in ("/v1/models", "/models"):
             try:
                 resp = requests.get(f"{endpoint.rstrip('/')}{path}", timeout=timeout)
                 if resp.status_code == 200:
                     data = resp.json()
+                    elapsed_ms = (_time.monotonic() - start) * 1000
                     # OpenAI-compatible: {"object": "list", "data": [{"id": "...", ...}]}
                     if isinstance(data, dict) and "data" in data:
                         models = data["data"]
                         if isinstance(models, list) and len(models) > 0:
-                            result["model"] = models[0].get("id", "unknown")
+                            # Pick the embedding model specifically
+                            for m in models:
+                                model_id = m.get("id", "")
+                                if "embedding" in model_id.lower() or "nomic" in model_id.lower():
+                                    result["model"] = model_id
+                                    result["status"] = "ok"
+                                    # Get dimension from model metadata if available
+                                    if isinstance(m, dict):
+                                        dims = m.get("dimensions") or m.get("embedding_dimensions")
+                                        if dims:
+                                            result["dimension"] = int(dims)
+                                    # Fallback: probe with a test embedding to infer dimension
+                                    if result["dimension"] is None:
+                                        remaining_timeout = max(timeout - elapsed_ms / 1000, 1)
+                                        dims = _probe_embedding_dimension(endpoint, remaining_timeout)
+                                        result["dimension"] = dims
+                                    return result
+                            # No embedding model found — return first model as fallback
+                            result["model"] = models[0].get("id", "unknown") if isinstance(models[0], dict) else str(models[0])
                             result["status"] = "ok"
                             return result
                     # LMS may return a flat list of model strings or {"model": "..."}
@@ -189,6 +215,27 @@ def check_embedding(endpoint: str, timeout: int = 5) -> EmbeddingHealth:
     return result
 
 
+def _probe_embedding_dimension(endpoint: str, timeout: int = 5) -> int | None:
+    """Probe the embedding endpoint with a test input to infer vector dimension."""
+    try:
+        resp = requests.post(
+            f"{endpoint.rstrip('/')}/v1/embeddings",
+            json={"model": "text-embedding-nomic-embed-text-v1.5", "input": "test"},
+            timeout=int(max(timeout, 1)),
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            embedding = data.get("data", data.get("embedding", []))
+            if isinstance(embedding, list) and len(embedding) > 0:
+                vec = embedding[0] if isinstance(embedding[0], (list, tuple)) else embedding[0].get("embedding", [])
+                return len(vec) if isinstance(vec, (list, tuple)) else None
+            elif isinstance(embedding, (list, tuple)):
+                return len(embedding)
+    except Exception:
+        pass
+    return None
+
+
 def check_llm(endpoint: str, timeout: int = 10) -> LLMHealth:
     """Check dreamer LLM (Qwen3.6-35B) reachability.
 
@@ -197,33 +244,40 @@ def check_llm(endpoint: str, timeout: int = 10) -> LLMHealth:
         timeout: Request timeout in seconds.
 
     Returns:
-        LLMHealth dict with status, endpoint, model.
+        LLMHealth dict with status, endpoint, model, latency_ms.
     """
+    import time as _time
+
     result: LLMHealth = {
         "status": "error",
         "endpoint": endpoint,
         "model": "unknown",
+        "latency_ms": None,
     }
     try:
-        # Try models endpoint first
+        start = _time.monotonic()
+        # Try /v1/models first (OpenAI-compatible LMS endpoint)
         try:
-            resp = requests.get(f"{endpoint.rstrip('/')}/models", timeout=timeout)
+            resp = requests.get(f"{endpoint.rstrip('/')}/v1/models", timeout=timeout)
             if resp.status_code == 200:
                 data = resp.json()
-                if isinstance(data, list) and len(data) > 0:
-                    model = data[0].get("model", "unknown")
-                elif isinstance(data, dict):
-                    model = data.get("model", data.get("model_name", "unknown"))
-                else:
-                    model = "unknown"
+                model = "unknown"
+                if isinstance(data, dict) and "data" in data:
+                    models = data["data"]
+                    if isinstance(models, list) and len(models) > 0:
+                        model = models[0].get("id", "unknown")
+                elif isinstance(data, list) and len(data) > 0:
+                    model = models[0].get("model", models[0].get("id", "unknown")) if isinstance(models[0], dict) else str(models[0])
                 result["status"] = "ok"
                 result["model"] = model
+                result["latency_ms"] = round((_time.monotonic() - start) * 1000, 1)
                 return result
         except Exception:
             pass
         # Fallback: light chat completions probe
+        start = _time.monotonic()
         resp = requests.post(
-            f"{endpoint.rstrip('/')}/chat/completions",
+            f"{endpoint.rstrip('/')}/v1/chat/completions",
             json={
                 "model": "qwen3.6-35b-instruct",
                 "messages": [{"role": "user", "content": "ping"}],
@@ -232,9 +286,10 @@ def check_llm(endpoint: str, timeout: int = 10) -> LLMHealth:
             },
             timeout=timeout,
         )
+        elapsed_ms = round((_time.monotonic() - start) * 1000, 1)
         if resp.status_code in (200, 201):
             result["status"] = "ok"
-            # Try to extract model name from response
+            result["latency_ms"] = elapsed_ms
             try:
                 data = resp.json()
                 result["model"] = data.get("model", "qwen3.6-35b-instruct")
@@ -242,6 +297,7 @@ def check_llm(endpoint: str, timeout: int = 10) -> LLMHealth:
                 result["model"] = "qwen3.6-35b-instruct"
         else:
             result["message"] = f"HTTP {resp.status_code}"
+            result["latency_ms"] = elapsed_ms
     except requests.exceptions.ConnectTimeout:
         result["message"] = "Connection timeout"
     except requests.exceptions.ConnectionError:

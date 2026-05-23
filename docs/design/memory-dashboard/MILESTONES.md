@@ -39,16 +39,18 @@ Three from SPEC §12, repeated here so they can't slip:
 
 | # | Decision | SPEC default | David's call |
 |---|---|---|---|
-| D1 | Tier 5 (knowledge graph) — defer to M4 as proposed, or pull a "top 10 entities" tile into M1? | Defer | ☐ defer / ☐ pull |
-| D2 | Activity feed transport — piggyback `/api/events` ws bus, or new dedicated `/api/memory/activity/stream` SSE? | Piggyback | ☐ piggyback / ☐ new SSE |
-| D3 | `[Run now ⚠]` button gating — cost-disclosing dialog only, or also typed-confirm? | Dialog only | ☐ dialog / ☐ typed |
+| D1 | Tier 5 (knowledge graph) — defer to M4 as proposed, or pull a "top 10 entities" tile into M1? | Defer | ☑ **defer** (resolved 2026-05-22) / ☐ pull |
+| D2 | Activity feed transport — piggyback `/api/events` ws bus, or new dedicated `/api/memory/activity/stream` SSE? | Piggyback | ☑ **piggyback** (resolved 2026-05-22) / ☐ new SSE |
+| D3 | `[Run now ⚠]` button gating — cost-disclosing dialog only, or also typed-confirm? | Dialog only | ☑ **dialog only** (resolved 2026-05-22) / ☐ typed |
 
 Two more flagged from SPEC §13 that block specific milestones:
 
 | # | Question | Blocks | Resolution path |
 |---|---|---|---|
-| D4 | Does `facts` schema have an `entity` column, or do we derive from `subject`/`object`? | M4 endpoints `/entities`, `/contradictions` | Inspect schema; one line of SQL: `PRAGMA table_info(facts);` |
-| D5 | Is `MetricsWriter` thread-safe under concurrent `POST /metrics/refresh`? | M1 endpoint hardening | Read `metrics_writer.py`; add `threading.Lock` if not. |
+| D4 | Does `facts` schema have an `entity` column, or do we derive from `subject`/`object`? | M4 endpoints `/entities`, `/contradictions` | **Resolved 2026-05-22**: `facts.entity` (TEXT) EXISTS (cid=6); also dedicated `entities` table + `fact_entities` join table — M4 endpoints should use the join table for proper multi-entity-per-fact semantics. `audit_log` table also exists (24 rows; resolves the §M3 TODO at line 294 below). |
+| D5 | Is `MetricsWriter` thread-safe under concurrent `POST /metrics/refresh`? | M1 endpoint hardening | **Resolved 2026-05-22**: Effectively thread-safe. `hermes_memory_core/metrics.py` opens a fresh SQLite connection per `.update()`, all queries are read-only, and the metrics.json write uses the atomic tmpfile+rename pattern. No `threading.Lock` needed for M1. Only concern is wasted compute on concurrent calls — address later via 5-second debounce if it ever matters. |
+
+**Backend route prefix:** the actual Hermes web server uses the prefix `/api/dashboard/` not `/api/` for dashboard-scoped endpoints (see `hermes_cli/web_server.py` — `/api/dashboard/plugins`, `/api/dashboard/plugins/rescan`, etc.). M1+ implementations should follow this convention: route URLs become `/api/dashboard/memory/status`, `/api/dashboard/memory/backends`, etc. The SPEC and API.md docs use the shorter `/api/memory/` form for readability — that is a documentation alias; the wire format follows the dashboard convention.
 
 ### 0.3 Approval signal
 

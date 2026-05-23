@@ -341,6 +341,34 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name }),
     }),
+
+  // Memory dashboard (M1).
+  //
+  // NOTE: SPEC.md / API.md document these routes as `/api/memory/...` for
+  // readability. The actual wire format is `/api/dashboard/memory/...` —
+  // matching the existing dashboard-scoped prefix convention used by
+  // `/api/dashboard/plugins`, etc. See MILESTONES.md §M1.
+  getMemoryStatus: () =>
+    fetchJSON<MemoryStatusResponse>("/api/dashboard/memory/status"),
+  getMemoryBackends: (refresh = false) =>
+    fetchJSON<MemoryBackendsResponse>(
+      `/api/dashboard/memory/backends${refresh ? "?refresh=true" : ""}`,
+    ),
+  getMemoryCounters: (force = false) =>
+    fetchJSON<MemoryCountersResponse>(
+      `/api/dashboard/memory/counters${force ? "?force=true" : ""}`,
+    ),
+  getMemoryMetricsJson: () =>
+    fetchJSON<Record<string, unknown>>("/api/dashboard/memory/metrics-json"),
+  postMemoryRefresh: () =>
+    fetchJSON<MemoryCountersResponse>("/api/dashboard/memory/metrics/refresh", {
+      method: "POST",
+    }),
+  postMemoryBackendPing: (name: MemoryBackendName) =>
+    fetchJSON<MemoryBackendInfo>(
+      `/api/dashboard/memory/backends/${encodeURIComponent(name)}/ping`,
+      { method: "POST" },
+    ),
 };
 
 export interface ActionResponse {
@@ -817,4 +845,79 @@ export interface AgentPluginUpdateResponse {
 export interface PluginProvidersPutRequest {
   memory_provider?: string;
   context_engine?: string;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Memory dashboard types (M1)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type MemoryHealthStatus = "ok" | "degraded" | "error" | "inactive";
+export type MemoryComponentStatus = "ok" | "degraded" | "error";
+export type MemoryBackendName =
+  | "sqlite"
+  | "qdrant"
+  | "embedding"
+  | "llm"
+  | "disk";
+
+export interface MemoryComponentInfo {
+  status: MemoryComponentStatus;
+  message: string | null;
+}
+
+export interface MemoryStatusResponse {
+  provider: string;
+  active: boolean;
+  installed: boolean;
+  overall: MemoryHealthStatus;
+  components: Record<string, MemoryComponentInfo> | null;
+  checked_at: string;
+  cached?: boolean;
+  cache_ttl?: number;
+}
+
+export interface MemoryBackendInfo {
+  status: MemoryComponentStatus;
+  message: string | null;
+  last_success_at?: string | null;
+  // Optional fields — present per-backend, missing on others.
+  path?: string;
+  journal_mode?: string;
+  size_bytes?: number;
+  endpoint?: string;
+  collections_count?: number;
+  collections?: string[];
+  points_count?: number;
+  model?: string;
+  dim?: number;
+  last_latency_ms?: number;
+  free_bytes?: number;
+  free_gb?: number;
+}
+
+export interface MemoryBackendsResponse {
+  sqlite?: MemoryBackendInfo;
+  qdrant?: MemoryBackendInfo;
+  embedding?: MemoryBackendInfo;
+  llm?: MemoryBackendInfo;
+  disk?: MemoryBackendInfo;
+  checked_at: string;
+}
+
+export interface MemoryCountersResponse {
+  facts_total: number;
+  facts_active: number;
+  captured_turns_24h: number;
+  chunks_indexed_24h: number;
+  chunks_pending: number;
+  qdrant_points: number;
+  last_dream_run_at: string | null;
+  last_dream_status: string | null;
+  redactions_24h: number;
+  deltas_24h: {
+    facts_active?: number;
+    qdrant_points?: number;
+  } | null;
+  metrics_file?: string;
+  stale_seconds: number;
 }

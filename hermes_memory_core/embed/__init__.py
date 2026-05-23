@@ -1,8 +1,10 @@
 """
 LMS embedding client for Hermes Local Memory.
 
-Uses the local LMS server at ``192.168.2.105:1235`` with
+Uses the LOCAL LMS server at ``http://localhost:1235`` with
 ``text-embedding-nomic-embed-text-v1.5`` (dimension 768).
+Embedding runs on the LOCAL LMStudio instance (not the remote Spark2 GPU
+machine) to eliminate any cross-host network contention.
 """
 
 from __future__ import annotations
@@ -15,7 +17,10 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-LMS_ENDPOINT = "http://192.168.2.105:1235"
+# Embeddings: LOCAL LMStudio — never change this to a remote IP.
+# The dreamer pipeline calls this concurrently with agent inference on
+# Spark2's GPU; routing embeddings over localhost removes that contention.
+LMS_ENDPOINT = "http://localhost:1235"
 LMS_URL = f"{LMS_ENDPOINT}/v1/embeddings"
 EMBED_MODEL = "text-embedding-nomic-embed-text-v1.5"
 EMBED_DIM = 768

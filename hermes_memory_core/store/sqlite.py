@@ -1578,6 +1578,8 @@ class MemoryDB(MemoryStore):
               - top_facts: list of {fact_id, hit_count} for most-retrieved facts
               - never_retrieved: list of {fact_id, fact_text, created_at} for
                 facts written more than 7 days ago that were never retrieved
+              - avg_latency_ms: average latency in ms across audit rows
+              - hit_rate: percentage of queries that returned at least one result
         """
         conn = self._conn_or_init()
         cur = conn.cursor()
@@ -1632,6 +1634,8 @@ class MemoryDB(MemoryStore):
             "queries_by_mode": queries_by_mode,
             "top_facts": top_facts,
             "never_retrieved": never_retrieved,
+            "avg_latency_ms": _avg_latency_ms(conn, days),
+            "hit_rate": _hit_rate(conn, days),
         }
 
     def health_check(self) -> dict:
@@ -1645,6 +1649,55 @@ class MemoryDB(MemoryStore):
                 conn.close()
         except Exception as e:
             return {"status": "error", "error": str(e)}
+
+
+# ── Helper functions for get_memory_stats ─────────────────────────────────────
+
+def _avg_latency_ms(conn, days: int) -> float | None:
+    """Compute average latency_ms across all audit rows in the period."""
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """SELECT AVG(latency_ms) FROM retrieval_audit
+               WHERE created_at >= datetime('now', '-' || ? || ' days')
+                 AND latency_ms IS NOT NULL""",
+            (days,),
+        )
+        row = cur.fetchone()
+        return float(row[0]) if row and row[0] is not None else None
+    except sqlite3.OperationalError:
+        # latency_ms column may not exist in older schemas
+        return None
+
+
+def _hit_rate(conn, days: int) -> float | None:
+    """Compute percentage of queries that returned at least one result.
+
+    hit_rate = (queries with at least one result) / (total queries) * 100
+    """
+    cur = conn.cursor()
+    cur.execute(
+        """SELECT COUNT(DISTINCT session_id || query || mode)
+           FROM retrieval_audit
+           WHERE created_at >= datetime('now', '-' || ? || ' days')
+             AND fact_id IS NOT NULL""",
+        (days,),
+    )
+    row_with_hits = cur.fetchone()
+    queries_with_hits = row_with_hits[0] if row_with_hits else 0
+
+    cur.execute(
+        """SELECT COUNT(DISTINCT session_id || query || mode)
+           FROM retrieval_audit
+           WHERE created_at >= datetime('now', '-' || ? || ' days')""",
+        (days,),
+    )
+    row_total = cur.fetchone()
+    total_queries = row_total[0] if row_total else 0
+
+    if total_queries == 0:
+        return None
+    return round((queries_with_hits / total_queries) * 100, 2)
 
 
 # ── Module-level singleton ─────────────────────────────────────────────────────

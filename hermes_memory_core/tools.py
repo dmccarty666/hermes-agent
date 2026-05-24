@@ -222,7 +222,7 @@ def _handle_memory_query(args: Dict[str, Any], **kwargs) -> Dict[str, Any]:
             "backend_hints": ["fts5"],
         }
 
-    if mode == "unknown":
+    if mode in ("unknown", "open_questions"):
         # Surface unanswered open questions from recent sessions
         db = _get_memory_db(kwargs)
         project_filter = filters.get("project") if filters else None

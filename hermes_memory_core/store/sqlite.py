@@ -276,6 +276,22 @@ CREATE TABLE IF NOT EXISTS entity_lifecycle (
     source_ref    TEXT DEFAULT ''
 );
 
+-- retrieval_audit (MEM-019): track every memory query hit for analytics
+CREATE TABLE IF NOT EXISTS retrieval_audit (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL,
+  query      TEXT NOT NULL,
+  mode       TEXT NOT NULL,
+  fact_id    TEXT NOT NULL,
+  score      REAL NOT NULL,
+  hit_rank   INTEGER NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_audit_session ON retrieval_audit(session_id);
+CREATE INDEX IF NOT EXISTS idx_audit_fact    ON retrieval_audit(fact_id);
+CREATE INDEX IF NOT EXISTS idx_audit_mode    ON retrieval_audit(mode);
+CREATE INDEX IF NOT EXISTS idx_audit_created  ON retrieval_audit(created_at);
+
 -- FTS5 virtual tables (all auto-synced via triggers)
 CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
   content, session_id UNINDEXED, turn_id UNINDEXED, project UNINDEXED, timestamp UNINDEXED,
@@ -1525,6 +1541,93 @@ class MemoryDB(MemoryStore):
             conn.commit()
         finally:
             conn.close()
+
+    def audit_hit(
+        self,
+        session_id: str,
+        query: str,
+        mode: str,
+        fact_id: str,
+        score: float,
+        hit_rank: int,
+    ) -> None:
+        """Record that a memory query returned a specific fact as a hit.
+
+        Used for the retrieval analytics dashboard (MEM-019).
+        """
+        conn = self._conn_or_init()
+        conn.execute(
+            """INSERT INTO retrieval_audit (session_id, query, mode, fact_id, score, hit_rank)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (session_id, query, mode, fact_id, score, hit_rank),
+        )
+        conn.commit()
+
+    def get_memory_stats(self, days: int = 30) -> dict:
+        """Return memory usage analytics for the last N days.
+
+        Returns:
+            dict with keys:
+              - total_queries: total query count
+              - queries_by_mode: list of {mode, count} sorted by count desc
+              - top_facts: list of {fact_id, hit_count} for most-retrieved facts
+              - never_retrieved: list of {fact_id, fact_text, created_at} for
+                facts written more than 7 days ago that were never retrieved
+        """
+        conn = self._conn_or_init()
+        cur = conn.cursor()
+
+        # queries by mode
+        cur.execute(
+            """SELECT mode, COUNT(*) as cnt
+               FROM retrieval_audit
+               WHERE created_at >= datetime('now', '-' || ? || ' days')
+               GROUP BY mode ORDER BY cnt DESC""",
+            (days,),
+        )
+        queries_by_mode = [{"mode": r[0], "count": r[1]} for r in cur.fetchall()]
+
+        # total queries
+        cur.execute(
+            """SELECT COUNT(*) FROM retrieval_audit
+               WHERE created_at >= datetime('now', '-' || ? || ' days')""",
+            (days,),
+        )
+        row = cur.fetchone()
+        total_queries = row[0] if row else 0
+
+        # top facts
+        cur.execute(
+            """SELECT fact_id, COUNT(*) as hits
+               FROM retrieval_audit
+               WHERE created_at >= datetime('now', '-' || ? || ' days')
+               GROUP BY fact_id ORDER BY hits DESC LIMIT 20""",
+            (days,),
+        )
+        top_facts = [{"fact_id": r[0], "hit_count": r[1]} for r in cur.fetchall()]
+
+        # never retrieved: facts written > 7 days ago and never in retrieval_audit
+        cur.execute(
+            """SELECT f.fact_id, f.fact_text, f.created_at
+               FROM facts f
+               WHERE f.created_at < datetime('now', '-7 days')
+                 AND f.status = 'active'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM retrieval_audit ra WHERE ra.fact_id = f.fact_id
+                 )
+               ORDER BY f.created_at DESC LIMIT 50"""
+        )
+        never_retrieved = [
+            {"fact_id": r[0], "fact_text": r[1], "created_at": r[2]}
+            for r in cur.fetchall()
+        ]
+
+        return {
+            "total_queries": total_queries,
+            "queries_by_mode": queries_by_mode,
+            "top_facts": top_facts,
+            "never_retrieved": never_retrieved,
+        }
 
     def health_check(self) -> dict:
         """Return health status."""

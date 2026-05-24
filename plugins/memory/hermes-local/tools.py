@@ -8,6 +8,8 @@ Implements the 7 tool interfaces defined in TDD §5.2:
 
 from typing import Any, Dict, List
 
+from tools.approval import get_current_session_key
+
 # ── Tool Schemas ─────────────────────────────────────────────────────────────
 
 MEMORY_QUERY_SCHEMA = {
@@ -316,6 +318,13 @@ def _handle_memory_query(params: dict[str, Any]) -> dict[str, Any]:
             rows = store.get_recent_sessions(limit=limit)
             formatted = [_format_session(r) for r in rows]
             mode_info = {}
+        # MEM-019: audit fact hits for analytics
+        if mode == "facts":
+            session_id = get_current_session_key(default="unknown")
+            for rank, item in enumerate(formatted, start=1):
+                fid = item.get("id")
+                if fid:
+                    store.audit_hit(session_id=session_id, query=query, mode=mode, fact_id=fid, score=1.0, hit_rank=rank)
         return {
             "results": formatted,
             "mode": mode,
@@ -362,8 +371,16 @@ def _handle_memory_query(params: dict[str, Any]) -> dict[str, Any]:
                 }
                 if open_qs:
                     mode_info["open_questions"] = open_qs
+                # MEM-019: audit retrieval hits for analytics
+                session_id = get_current_session_key(default="unknown")
+                formatted_results = [_format_hybrid_hit(h) for h in filtered_hits]
+                for rank, item in enumerate(formatted_results, start=1):
+                    fid = item.get("id")
+                    if fid:
+                        score = item.get("score", 0.0)
+                        store.audit_hit(session_id=session_id, query=query, mode=mode, fact_id=fid, score=float(score), hit_rank=rank)
                 return {
-                    "results": [_format_hybrid_hit(h) for h in filtered_hits],
+                    "results": formatted_results,
                     "mode": mode,
                     "total": len(filtered_hits),
                     "query": query,
@@ -440,6 +457,12 @@ def _handle_memory_query(params: dict[str, Any]) -> dict[str, Any]:
                              if q_lower in (r.get("decision_text") or "").lower()]
         combined = matched_facts + matched_decisions
         limited = combined[:limit]
+        # MEM-019: audit fact hits for analytics
+        session_id = get_current_session_key(default="unknown")
+        for rank, item in enumerate(limited, start=1):
+            fid = item.get("id")
+            if fid:
+                store.audit_hit(session_id=session_id, query=query, mode=mode, fact_id=fid, score=1.0, hit_rank=rank)
         return {
             "results": limited,
             "mode": mode,
@@ -451,6 +474,12 @@ def _handle_memory_query(params: dict[str, Any]) -> dict[str, Any]:
     # Unknown mode — return recent facts as a safe default
     rows = store.get_facts(project=project, limit=limit)
     formatted = [_format_fact(r) for r in rows]
+    # MEM-019: audit fact hits for analytics
+    session_id = get_current_session_key(default="unknown")
+    for rank, item in enumerate(formatted, start=1):
+        fid = item.get("id")
+        if fid:
+            store.audit_hit(session_id=session_id, query=query, mode=mode, fact_id=fid, score=1.0, hit_rank=rank)
     return {
         "results": formatted,
         "mode": mode,

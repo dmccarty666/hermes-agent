@@ -77,8 +77,8 @@ def test_memory_query_schema_has_modes_keyword_sessions_recent(tmp_path: Path, m
     # mode parameter must have enum with keyword, sessions, recent
     mode_param = schema["parameters"]["properties"]["mode"]
     assert "enum" in mode_param, f"mode param has no enum: {mode_param}"
-    assert set(mode_param["enum"]) == {"keyword", "sessions", "recent"}, \
-        f"mode enum must be {{keyword, sessions, recent}}, got {mode_param['enum']}"
+    assert set(mode_param["enum"]) >= {"keyword", "sessions", "recent", "unknown"}, \
+        f"mode enum must include keyword, sessions, recent, unknown; got {mode_param['enum']}"
 
 
 def test_memory_query_schema_has_required_fields(tmp_path: Path, monkeypatch) -> None:

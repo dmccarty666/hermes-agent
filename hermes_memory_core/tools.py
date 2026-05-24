@@ -26,7 +26,8 @@ MEMORY_QUERY_SCHEMA: Dict[str, Any] = {
     "name": "memory_query",
     "description": (
         "Search the local memory. Modes: 'keyword' (FTS5 full-text), "
-        "'sessions' (recent sessions), 'recent' (recent turns). "
+        "'sessions' (recent sessions), 'recent' (recent turns), "
+        "'unknown' (open questions from recent sessions). "
         "Other modes ('semantic', 'hybrid', etc.) are not yet implemented."
     ),
     "parameters": {
@@ -35,7 +36,7 @@ MEMORY_QUERY_SCHEMA: Dict[str, Any] = {
             "query":   {"type": "string"},
             "mode":    {
                 "type": "string",
-                "enum": ["keyword", "sessions", "recent", "probe", "related", "reason"],
+                "enum": ["keyword", "sessions", "recent", "unknown", "probe", "related", "reason"],
                 "default": "keyword",
             },
             "project": {"type": "string"},
@@ -219,6 +220,28 @@ def _handle_memory_query(args: Dict[str, Any], **kwargs) -> Dict[str, Any]:
             "query": query,
             "mode": mode,
             "backend_hints": ["fts5"],
+        }
+
+    if mode == "unknown":
+        # Surface unanswered open questions from recent sessions
+        db = _get_memory_db(kwargs)
+        project_filter = filters.get("project") if filters else None
+        questions = db.get_open_questions(project=project_filter, limit=limit)
+        results = [
+            {
+                "content": q.get("question_text", ""),
+                "source_ref": f"question:{q.get('question_id', '')}",
+                "excerpt": q.get("question_text", "")[:200],
+                "score": 0.0,
+                "mode": "unknown",
+            }
+            for q in questions
+        ]
+        return {
+            "results": results,
+            "query": query or "open questions",
+            "mode": mode,
+            "backend_hints": ["sqlite"],
         }
 
     if mode == "semantic":

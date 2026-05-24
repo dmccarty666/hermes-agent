@@ -397,6 +397,11 @@ class MemoryStore:
                     "ALTER TABLE facts ADD COLUMN trust_score REAL DEFAULT 0.5",
                     # fact_entities: add role column
                     "ALTER TABLE fact_entities ADD COLUMN role TEXT DEFAULT 'mentioned'",
+                    # MEM-012: sessions.episode_id (episodes table already in _SCHEMA_SQL)
+                    "ALTER TABLE sessions ADD COLUMN episode_id TEXT",
+                    # MEM-018: per-fact decay rate override
+                    "ALTER TABLE facts ADD COLUMN decay_rate_days REAL",
+                    # MEM-019: retrieval_audit indexes already in _SCHEMA_SQL; just ensure table present via IF NOT EXISTS
                 )
                 for stmt in _migrations:
                     try:
@@ -1644,14 +1649,14 @@ class MemoryDB(MemoryStore):
 
 # ── Module-level singleton ─────────────────────────────────────────────────────
 
-_store: MemoryStore | None = None
+_store: MemoryDB | None = None
 _store_lock = threading.Lock()
 
 
-def get_memory_store(db_path: Path | str | None = None) -> MemoryStore:
-    """Return a process-wide MemoryStore singleton."""
+def get_memory_store(db_path: Path | str | None = None) -> MemoryDB:
+    """Return a process-wide MemoryDB singleton (MEM-019: audit_hit/get_memory_stats on MemoryDB)."""
     global _store
     with _store_lock:
         if _store is None:
-            _store = MemoryStore(db_path)
+            _store = MemoryDB(db_path)
         return _store

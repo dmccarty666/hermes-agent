@@ -24,7 +24,17 @@ MEMORY_QUERY_SCHEMA = {
         "type": "object",
         "properties": {
             "query":   {"type": "string"},
-            "mode":    {"type": "string", "default": "hybrid"},
+            "mode":    {
+                "type": "string",
+                "default": "hybrid",
+                "enum": ["hybrid", "semantic", "keyword", "facts", "decisions",
+                         "open_questions", "sessions", "daily", "project", "recent",
+                         "probe", "related", "reason", "unknown"],
+                "description": (
+                    "Query mode. 'unknown' surfaces unresolved open questions "
+                    "from recent sessions. 'episode' returns episodes for the project."
+                ),
+            },
             "project": {"type": "string"},
             "entity":  {"type": "string"},
             "entities": {"type": "array", "items": {"type": "string"}},

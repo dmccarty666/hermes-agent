@@ -33,7 +33,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 # ---------------------------------------------------------------------------
 # WAL-compatibility fallback
@@ -187,6 +187,20 @@ CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS episodes (
+    id              TEXT PRIMARY KEY,
+    title           TEXT,
+    description     TEXT,
+    source          TEXT NOT NULL,
+    user_id         TEXT,
+    started_at      REAL NOT NULL,
+    ended_at        REAL,
+    session_count   INTEGER DEFAULT 0,
+    message_count   INTEGER DEFAULT 0,
+    token_count     INTEGER DEFAULT 0,
+    created_at      REAL NOT NULL DEFAULT (unixepoch())
+);
+
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     source TEXT NOT NULL,
@@ -195,6 +209,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     model_config TEXT,
     system_prompt TEXT,
     parent_session_id TEXT,
+    episode_id TEXT,
     started_at REAL NOT NULL,
     ended_at REAL,
     end_reason TEXT,
@@ -245,8 +260,13 @@ CREATE TABLE IF NOT EXISTS state_meta (
     value TEXT
 );
 
+CREATE INDEX IF NOT EXISTS idx_episodes_source   ON episodes(source);
+CREATE INDEX IF NOT EXISTS idx_episodes_started  ON episodes(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_episodes_user_id   ON episodes(user_id);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_episode ON sessions(episode_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 """
@@ -692,6 +712,28 @@ class SessionDB:
         self._conn.commit()
 
     # =========================================================================
+    # Episode helpers
+    # =========================================================================
+
+    def get_or_create_episode(
+        self,
+        episode_id: str,
+        source: str,
+        user_id: str = None,
+        title: str = None,
+    ) -> str:
+        """Get existing episode or create a new one. Returns episode_id."""
+        started_at = time.time()
+        def _do(conn):
+            conn.execute(
+                """INSERT OR IGNORE INTO episodes (id, source, user_id, title, started_at, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (episode_id, source, user_id, title, started_at, started_at),
+            )
+        self._execute_write(_do)
+        return episode_id
+
+    # =========================================================================
     # Session lifecycle
     # =========================================================================
 
@@ -704,13 +746,18 @@ class SessionDB:
         system_prompt: str = None,
         user_id: str = None,
         parent_session_id: str = None,
+        episode_id: str = None,
     ) -> None:
         """Shared INSERT OR IGNORE for session rows."""
+        # Auto-create episode if not exists
+        if episode_id:
+            self.get_or_create_episode(episode_id, source, user_id)
+
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
-                   system_prompt, parent_session_id, started_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   system_prompt, parent_session_id, episode_id, started_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     source,
@@ -719,14 +766,22 @@ class SessionDB:
                     json.dumps(model_config) if model_config else None,
                     system_prompt,
                     parent_session_id,
+                    episode_id,
                     time.time(),
                 ),
             )
         self._execute_write(_do)
 
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
-        """Create a new session record. Returns the session_id."""
-        self._insert_session_row(session_id, source, **kwargs)
+        """Create a new session record. Returns the session_id.
+
+        Accepts an optional 'episode_id' kwarg. If provided and the episode
+        doesn't exist, it will be auto-created.
+        """
+        episode_id = kwargs.pop("episode_id", None)
+        if episode_id:
+            self.get_or_create_episode(episode_id, source, kwargs.get("user_id"))
+        self._insert_session_row(session_id, source, episode_id=episode_id, **kwargs)
         return session_id
     def end_session(self, session_id: str, end_reason: str) -> None:
         """Mark a session as ended.

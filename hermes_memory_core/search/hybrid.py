@@ -167,8 +167,37 @@ class ScoredResult:
 # Freshness decay (exposed for tests)
 # ---------------------------------------------------------------------------#
 
-def freshness_decay(updated_at: Optional[str], half_life_days: float = 90.0) -> float:
+def _fetch_decay_rate(memory_db: Any, chunk_id: str, fts_table: str = "chunks") -> Optional[float]:
+    """Look up decay_rate_days from facts table. Returns None if not set or table doesn't match.
+
+    For "facts" rows, chunk_id is actually the fact_id.
+    For "chunks"/"decisions" rows, returns None (those tables don't have decay_rate_days).
+    """
+    if fts_table != "facts":
+        return None
+    try:
+        conn = memory_db._connect()
+        row = conn.execute(
+            "SELECT decay_rate_days FROM facts WHERE fact_id = ?",
+            (chunk_id,),
+        ).fetchone()
+        conn.close()
+        if row and row[0] is not None:
+            return float(row[0])
+    except Exception:
+        pass
+    return None
+
+
+def freshness_decay(
+    updated_at: Optional[str],
+    half_life_days: float = 90.0,
+    decay_rate_days: Optional[float] = None,
+) -> float:
     """Apply exponential decay based on content age.
+
+    Uses per-fact ``decay_rate_days`` when available (from facts.decay_rate_days column),
+    otherwise falls back to the global ``half_life_days``.
 
     Returns 1.0 when updated_at is missing.
     """
@@ -180,9 +209,11 @@ def freshness_decay(updated_at: Optional[str], half_life_days: float = 90.0) -> 
         dt = datetime.fromisoformat(updated_at).replace(tzinfo=timezone.utc)
     except ValueError:
         return 1.0
+    # Prefer per-fact decay_rate_days over global half_life_days
+    effective_half_life = decay_rate_days if decay_rate_days is not None else half_life_days
     now = datetime.now(timezone.utc)
     age_days = (now - dt).total_seconds() / 86400.0
-    return 0.5 ** (age_days / half_life_days) if half_life_days else 1.0
+    return 0.5 ** (age_days / effective_half_life) if effective_half_life else 1.0
 
 
 # -------------------------------------------------------------------------- #
@@ -625,8 +656,15 @@ def search(
             result.trust_score = _fetch_trust(
                 memory_db, result.chunk_id, fts_table=result.metadata.get("fts_table", "chunks")
             )
+        # Fetch per-fact decay_rate_days for facts table
+        decay_rate_days = None
+        if memory_db is not None:
+            decay_rate_days = _fetch_decay_rate(
+                memory_db, result.chunk_id, fts_table=result.metadata.get("fts_table", "chunks")
+            )
         result.freshness_decay = freshness_decay(
-            result.metadata.get("timestamp") or result.metadata.get("date")
+            result.metadata.get("timestamp") or result.metadata.get("date"),
+            decay_rate_days=decay_rate_days,
         )
         # Compute centrality boost for facts with linked entities
         centrality_boost = 0.0
@@ -709,9 +747,14 @@ class HybridScorer:
                         limit=limit, memory_db=memory_db)
         return [ScoredResult(**r) for r in result["results"]]
 
-    def _freshness_decay(self, updated_at: Optional[str], half_life_days: float = 90.0) -> float:
+    def _freshness_decay(
+        self,
+        updated_at: Optional[str],
+        half_life_days: float = 90.0,
+        decay_rate_days: Optional[float] = None,
+    ) -> float:
         """Instance method wrapper around module-level freshness_decay."""
-        return freshness_decay(updated_at, half_life_days)
+        return freshness_decay(updated_at, half_life_days, decay_rate_days)
 
     def _deduplicate(self, results: List[ScoredResult]) -> List[ScoredResult]:
         """Instance method wrapper around module-level _deduplicate."""

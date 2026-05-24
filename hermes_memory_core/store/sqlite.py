@@ -7,6 +7,7 @@ are idempotent where possible (content_hash dedup, dream_status flags).
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
@@ -251,6 +252,18 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
 
+-- fact_links (cross-fact dependency graph — MEM-016)
+CREATE TABLE IF NOT EXISTS fact_links (
+  link_id    TEXT PRIMARY KEY,
+  fact_id_a  TEXT NOT NULL REFERENCES facts(fact_id),
+  fact_id_b  TEXT NOT NULL REFERENCES facts(fact_id),
+  link_type  TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(fact_id_a, fact_id_b)
+);
+CREATE INDEX IF NOT EXISTS idx_fact_links_a ON fact_links(fact_id_a);
+CREATE INDEX IF NOT EXISTS idx_fact_links_b ON fact_links(fact_id_b);
+
 -- entity lifecycle (G3.4)
 CREATE TABLE IF NOT EXISTS entity_lifecycle (
     entity_name   TEXT PRIMARY KEY,
@@ -325,87 +338,99 @@ class MemoryStore:
     def _ensure_init(self) -> None:
         if self._initialized:
             return
-        with self._lock:
+        # Prevent cross-process races on first init: acquire an exclusive
+        # advisory lock on a sentinel file before doing any schema work.
+        # LOCK_EX blocks until the lock is held; LOCK_UN is implicit on close.
+        lock_path = str(self._db_path) + ".lock"
+        lock_fd = open(lock_path, "w")
+        try:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
             if self._initialized:
                 return
-            DB_DIR.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(str(self._db_path), timeout=30.0, isolation_level=None)
-            conn.execute("PRAGMA journal_mode=WAL")
-            # Verify WAL actually took — some filesystems (NFS, docker overlay)
-            # silently reject WAL and fall back to rollback mode, which allows
-            # concurrent writes to corrupt data. Detect this immediately.
-            cur = conn.execute("PRAGMA journal_mode")
-            mode = cur.fetchone()[0]
-            if mode != "wal":
-                raise RuntimeError(
-                    f"WAL mode requested but filesystem returned '{mode}'. "
-                    "Concurrent writes may corrupt data. Check filesystem capabilities "
-                    "or switch to a native filesystem for the memory DB path."
-                )
-            conn.execute("PRAGMA foreign_keys=ON")
-            conn.executescript(_SCHEMA_SQL)
+            with self._lock:
+                if self._initialized:
+                    return
+                DB_DIR.mkdir(parents=True, exist_ok=True)
+                conn = sqlite3.connect(str(self._db_path), timeout=30.0, isolation_level=None)
+                conn.execute("PRAGMA journal_mode=WAL")
+                # Verify WAL actually took — some filesystems (NFS, docker overlay)
+                # silently reject WAL and fall back to rollback mode, which allows
+                # concurrent writes to corrupt data. Detect this immediately.
+                cur = conn.execute("PRAGMA journal_mode")
+                mode = cur.fetchone()[0]
+                if mode != "wal":
+                    raise RuntimeError(
+                        f"WAL mode requested but filesystem returned '{mode}'. "
+                        "Concurrent writes may corrupt data. Check filesystem capabilities "
+                        "or switch to a native filesystem for the memory DB path."
+                    )
+                conn.execute("PRAGMA foreign_keys=ON")
+                conn.executescript(_SCHEMA_SQL)
 
-            # ── Idempotent migrations for pre-existing DBs ─────────────────────
-            # These ALTER TABLE statements are safe to re-run: SQLite raises
-            # OperationalError when the column already exists (or the table
-            # doesn't yet), which we swallow.
-            _migrations = (
-                # entities: add missing columns from unified schema
-                "ALTER TABLE entities ADD COLUMN alias_json TEXT DEFAULT '[]'",
-                "ALTER TABLE entities ADD COLUMN entity_subtype TEXT",
-                "ALTER TABLE entities ADD COLUMN project TEXT",
-                "ALTER TABLE entities ADD COLUMN updated_at TEXT",
-                # facts: trust_score (was missing in some versions)
-                "ALTER TABLE facts ADD COLUMN trust_score REAL DEFAULT 0.5",
-                # fact_entities: add role column
-                "ALTER TABLE fact_entities ADD COLUMN role TEXT DEFAULT 'mentioned'",
-            )
-            for stmt in _migrations:
+                # ── Idempotent migrations for pre-existing DBs ─────────────────────
+                # These ALTER TABLE statements are safe to re-run: SQLite raises
+                # OperationalError when the column already exists (or the table
+                # doesn't yet), which we swallow.
+                _migrations = (
+                    # entities: add missing columns from unified schema
+                    "ALTER TABLE entities ADD COLUMN alias_json TEXT DEFAULT '[]'",
+                    "ALTER TABLE entities ADD COLUMN entity_subtype TEXT",
+                    "ALTER TABLE entities ADD COLUMN project TEXT",
+                    "ALTER TABLE entities ADD COLUMN updated_at TEXT",
+                    # facts: trust_score (was missing in some versions)
+                    "ALTER TABLE facts ADD COLUMN trust_score REAL DEFAULT 0.5",
+                    # fact_entities: add role column
+                    "ALTER TABLE fact_entities ADD COLUMN role TEXT DEFAULT 'mentioned'",
+                )
+                for stmt in _migrations:
+                    try:
+                        conn.execute(stmt)
+                    except sqlite3.OperationalError:
+                        pass  # column already exists or table freshly created
+
+                # Ensure entity_relations exists (may already exist from _SCHEMA_SQL)
                 try:
-                    conn.execute(stmt)
+                    conn.execute(
+                        "CREATE TABLE IF NOT EXISTS entity_relations ("
+                        "  relation_id       TEXT PRIMARY KEY,"
+                        "  source_entity_id TEXT NOT NULL REFERENCES entities(entity_id),"
+                        "  target_entity_id TEXT NOT NULL REFERENCES entities(entity_id),"
+                        "  relation_type    TEXT NOT NULL,"
+                        "  source_ref       TEXT,"
+                        "  confidence       REAL DEFAULT 0.5,"
+                        "  created_at       TEXT NOT NULL,"
+                        "  UNIQUE(source_entity_id, target_entity_id, relation_type)"
+                        ")"
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_relations_source "
+                        "ON entity_relations(source_entity_id)"
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_relations_target "
+                        "ON entity_relations(target_entity_id)"
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_relations_type "
+                        "ON entity_relations(relation_type)"
+                    )
                 except sqlite3.OperationalError:
-                    pass  # column already exists or table freshly created
+                    pass  # table already exists
 
-            # Ensure entity_relations exists (may already exist from _SCHEMA_SQL)
-            try:
-                conn.execute(
-                    "CREATE TABLE IF NOT EXISTS entity_relations ("
-                    "  relation_id       TEXT PRIMARY KEY,"
-                    "  source_entity_id TEXT NOT NULL REFERENCES entities(entity_id),"
-                    "  target_entity_id TEXT NOT NULL REFERENCES entities(entity_id),"
-                    "  relation_type    TEXT NOT NULL,"
-                    "  source_ref       TEXT,"
-                    "  confidence       REAL DEFAULT 0.5,"
-                    "  created_at       TEXT NOT NULL,"
-                    "  UNIQUE(source_entity_id, target_entity_id, relation_type)"
-                    ")"
-                )
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_relations_source "
-                    "ON entity_relations(source_entity_id)"
-                )
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_relations_target "
-                    "ON entity_relations(target_entity_id)"
-                )
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_relations_type "
-                    "ON entity_relations(relation_type)"
-                )
-            except sqlite3.OperationalError:
-                pass  # table already exists
-
-            # Record schema version
-            try:
-                conn.execute(
-                    "INSERT INTO schema_version VALUES (?, ?, ?)",
-                    (_utc_now(), 2, "unified entity/fact_entities schema + entity_relations"),
-                )
-            except sqlite3.IntegrityError:
-                pass  # already initialized
-            self._conn = conn
-            self._initialized = True
-            logger.info("MemoryStore initialized at %s", self._db_path)
+                # Record schema version
+                try:
+                    conn.execute(
+                        "INSERT INTO schema_version VALUES (?, ?, ?)",
+                        (_utc_now(), 2, "unified entity/fact_entities schema + entity_relations"),
+                    )
+                except sqlite3.IntegrityError:
+                    pass  # already initialized
+                self._conn = conn
+                self._initialized = True
+                logger.info("MemoryStore initialized at %s", self._db_path)
+        finally:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+            lock_fd.close()
 
     def _conn_or_init(self) -> sqlite3.Connection:
         self._ensure_init()
@@ -730,6 +755,17 @@ class MemoryStore:
         cols = [c[0] for c in conn.execute("PRAGMA table_info(facts)").fetchall()]
         return dict(zip(cols, row))
 
+    def get_fact_by_id(self, fact_id: str) -> Optional[Dict[str, Any]]:
+        """Look up a single fact by its fact_id."""
+        conn = self._conn_or_init()
+        row = conn.execute(
+            "SELECT * FROM facts WHERE fact_id = ?", (fact_id,),
+        ).fetchone()
+        if not row:
+            return None
+        cols = [c[0] for c in conn.execute("PRAGMA table_info(facts)").fetchall()]
+        return dict(zip(cols, row))
+
     # ── entity-fact links ───────────────────────────────────────────────────────
 
     def upsert_entity_for_fact(
@@ -750,6 +786,43 @@ class MemoryStore:
                VALUES (?, ?, ?)""",
             (fact_id, entity_id, role),
         )
+
+    def upsert_fact_link(
+        self,
+        fact_id_a: str,
+        fact_id_b: str,
+        link_type: str,
+    ) -> None:
+        """
+        Insert a cross-fact link. Safe to call multiple times — UNIQUE constraint
+        on (fact_id_a, fact_id_b) means duplicates are silently ignored.
+        link_type examples: 'same_turn', 'causal', 'contradicts'.
+        """
+        import uuid
+        conn = self._conn_or_init()
+        link_id = f"fl:{uuid.uuid4().hex[:16]}"
+        now = _utc_now()
+        conn.execute(
+            """INSERT OR IGNORE INTO fact_links
+               (link_id, fact_id_a, fact_id_b, link_type, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (link_id, fact_id_a, fact_id_b, link_type, now),
+        )
+
+    def get_fact_links(self, fact_id: str) -> List[Dict[str, Any]]:
+        """
+        Return all fact_links involving fact_id (as fact_id_a or fact_id_b).
+        Returns list of dicts with: link_id, fact_id_a, fact_id_b, link_type, created_at.
+        """
+        conn = self._conn_or_init()
+        rows = conn.execute(
+            """SELECT link_id, fact_id_a, fact_id_b, link_type, created_at
+               FROM fact_links
+               WHERE fact_id_a = ? OR fact_id_b = ?""",
+            (fact_id, fact_id),
+        ).fetchall()
+        cols = ["link_id", "fact_id_a", "fact_id_b", "link_type", "created_at"]
+        return [dict(zip(cols, row)) for row in rows]
 
     def upsert_entity(
         self,

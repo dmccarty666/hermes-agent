@@ -30,8 +30,18 @@ from __future__ import annotations
 import json
 import logging
 import os
+import signal
+import sqlite3
 import uuid
 from dataclasses import dataclass, field
+
+# ── SIGPIPE guard ─────────────────────────────────────────────────────────────
+# Prevent Unix SIGPIPE (signal 13) from killing the process when the LLM server
+# closes a connection mid-response.  Without this, SIGPIPE bypasses all Python
+# exception handling and terminates the process immediately — the post-pass
+# retry loop never gets a chance to run.  Setting SIG_DFL lets the C runtime
+# handle it as a regular signal rather than an unchecked interrupt.
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -39,6 +49,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from hermes_memory_core.store.sqlite import get_memory_store
 from hermes_memory_core.write.pipeline import write_memory
 from hermes_memory_core.dream.contradict import find_conflicts, mark_disputed, Conflict
+from hermes_memory_core.dream.rel_extract import RelationExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +115,10 @@ _DREAMER_SEMAPHORE = threading.Semaphore(1)
 # 4096 was truncating fact-extraction JSON mid-array on 3+ turn sessions,
 # producing un-parseable output. 8192 leaves comfortable headroom.
 MAX_TOKENS        = 8192
+# Hard stop for the entire run.  If the dreamer outlives this the LLM server
+# is either hung or the pipeline is in a slow loop.  Force-exit so the next
+# cron run can pick up remaining turns (via their pending / in_progress status).
+RUN_WATCHDOG_TIMEOUT = 2700   # 45 minutes — generous for slow GPU inference
 
 
 def _utc_now() -> str:
@@ -291,7 +306,9 @@ class DreamWorker:
         self._decisions_created: int = 0
         self._questions_created: int = 0
         self._contradictions_detected: int = 0
+        self._entities_linked: int = 0
         self._output_path: str = ""
+        self._relation_extractor = RelationExtractor()
 
         # Turn-level source_ref tracking: {(session_id, turn_id): source_ref}
         self._turn_source_refs: Dict[Tuple[str, str], str] = {}
@@ -373,7 +390,7 @@ class DreamWorker:
         scope: str,
         date: str | None,
         project: str | None,
-        session_id: str | None,
+        session_id: str | None = None,
     ) -> Dict[str, Any]:
         """Inner run body (called after semaphore is acquired)."""
         self._dream_run_id = f"dr:{uuid.uuid4().hex[:16]}"
@@ -385,7 +402,16 @@ class DreamWorker:
         self._decisions_created = 0
         self._questions_created = 0
         self._contradictions_detected = 0
+        self._entities_linked = 0
         self._failed_session_ids: List[str] = []
+
+        # ── Watchdog: hard stop after RUN_WATCHDOG_TIMEOUT ─────────────────────
+        def _watchdog_handler(signum, frame):
+            raise TimeoutError(
+                f"Dream run exceeded RUN_WATCHDOG_TIMEOUT ({RUN_WATCHDOG_TIMEOUT}s)"
+            )
+        signal.signal(signal.SIGALRM, _watchdog_handler)
+        signal.alarm(RUN_WATCHDOG_TIMEOUT)
 
         logger.info(
             "DreamWorker.run started: dream_run_id=%s scope=%s",
@@ -479,7 +505,11 @@ class DreamWorker:
             # Stage 9: record dream run + mark turns dreamed
             self._stage_record_dream_run(turns)
 
+            # G3.4: entity lifecycle GC (archive stale + GC old)
+            self._gc_lifecycle()
+
         except Exception as exc:
+            signal.alarm(0)  # cancel watchdog on any exit path
             logger.exception("DreamWorker.run failed: %s", exc)
             self._errors.append(str(exc))
             self.store.complete_dream_run(
@@ -962,11 +992,31 @@ class DreamWorker:
                 self._failed_session_ids.append(session_id)
             return []
         except Exception as exc:
-            logger.warning("extract__extract_facts failed for session %s: %s", session_id, exc)
+            # Connection resets, protocol errors, and HTTP 5xx all get the same
+            # graceful treatment as LLMTimeout — queue for post-pass retry.
+            import requests
+            is_connection_error = isinstance(exc, (
+                LLMTimeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.HTTPError,
+                ConnectionResetError,
+            ))
+            if not is_connection_error:
+                logger.exception("extract__extract_facts unexpected error: %s", exc)
+                raise  # truly unexpected — propagate
+            logger.warning(
+                "extract__extract_facts connection error for session %s -- queued for retry: %s",
+                session_id, exc,
+            )
             self._errors.append(f"extract__extract_facts {session_id}: {exc}")
-            raise  # unexpected -- propagate to _process_session
+            if session_id not in self._failed_session_ids:
+                self._failed_session_ids.append(session_id)
+            return []
 
         facts: List[Dict[str, Any]] = []
+        # Track (turn_idx -> list of fact_ids) for same-turn cross-links (MEM-016)
+        turn_fact_ids: Dict[int, List[str]] = {}
+
         for item in items:
             text = item.get("text", "").strip()
             if not text:
@@ -1004,6 +1054,80 @@ class DreamWorker:
                 from hermes_memory_core.write.redaction import hash_content
                 h = hash_content(res.get("redacted_text", text))
                 self._created_fact_ids[(h, item.get("scope", "general"))] = res["id"]
+                # G1.5: extract and link entities
+                if res["id"]:
+                    # Collect fact_id for same-turn linking (MEM-016)
+                    if turn_idx not in turn_fact_ids:
+                        turn_fact_ids[turn_idx] = []
+                    turn_fact_ids[turn_idx].append(res["id"])
+
+                    linked = self._link_entities_to_fact(res["id"], text)
+                    self._entities_linked += linked
+                    # G3.1: extract typed entity relations
+                    from hermes_memory_core.dream.entity import extract_entities
+
+                    entities = extract_entities(text)
+                    relations = self._relation_extractor(text, entities, res["id"])
+                    for rel in relations:
+                        import uuid
+
+                        rel_id = f"rel:{uuid.uuid4().hex[:16]}"
+                        src_id = self._safe_entity_id(rel.source_entity)
+                        tgt_id = self._safe_entity_id(rel.target_entity)
+                        if src_id is None or tgt_id is None:
+                            logger.debug(
+                                "Skipping relation %s: unresolved entity (%s → %s)",
+                                rel_id, rel.source_entity, rel.target_entity,
+                            )
+                            continue
+                        try:
+                            self.store.upsert_entity_relation(
+                                relation_id=rel_id,
+                                source_entity_id=src_id,
+                                target_entity_id=tgt_id,
+                                relation_type=rel.relation_type,
+                                source_ref=rel.source_ref,
+                                confidence=rel.confidence,
+                            )
+                        except sqlite3.IntegrityError:
+                            logger.debug("Relation %s skipped (duplicate or FK)", rel_id)
+
+                    # G3.2: Temporal entity reasoning — evolved_from / renamed_to edges
+                    if len(entities) >= 2:
+                        from hermes_memory_core.dream.temporal import (
+                            detect_versioned_entities,
+                            _extract_temporal_relations,
+                        )
+                        from hermes_memory_core.dream.worker import _llm_complete
+
+                        versioned = detect_versioned_entities(text)
+                        if versioned or True:  # Always try LLM detection
+                            temporal_edges = _extract_temporal_relations(
+                                text, [e.name for e in entities], _llm_complete
+                            )
+                            for edge in temporal_edges:
+                                import uuid
+
+                                tid = f"rel:{uuid.uuid4().hex[:16]}"
+                                src_id = self._safe_entity_id(edge.source_entity)
+                                tgt_id = self._safe_entity_id(edge.target_entity)
+                                if src_id is None or tgt_id is None:
+                                    logger.debug(
+                                        "Skipping temporal edge %s: unresolved entity (%s → %s)",
+                                        tid, edge.source_entity, edge.target_entity,
+                                    )
+                                    continue
+                                try:
+                                    self.store.upsert_entity_relation(
+                                        relation_id=tid,
+                                        source_entity_id=src_id,
+                                        target_entity_id=tgt_id,
+                                        relation_type=edge.relation_type,
+                                        source_ref=res["id"],
+                                        confidence=edge.confidence,
+                                    )
+                                except sqlite3.IntegrityError:
+                                    logger.debug("Temporal edge %s skipped (duplicate or FK)", tid)
             elif res["skipped"]:
                 self._facts_updated += 1
 
@@ -1016,7 +1140,77 @@ class DreamWorker:
                 "fact_id": res.get("id"),
             })
 
+        # MEM-016: create same-turn links for all turns that yielded multiple facts
+        for turn_idx, fid_list in turn_fact_ids.items():
+            if len(fid_list) < 2:
+                continue
+            for i in range(len(fid_list)):
+                for j in range(i + 1, len(fid_list)):
+                    try:
+                        self.store.upsert_fact_link(fid_list[i], fid_list[j], "same_turn")
+                    except Exception as exc:
+                        logger.debug("same_turn link (%s ↔ %s) skipped: %s", fid_list[i], fid_list[j], exc)
+
         return facts
+
+    def _safe_entity_id(self, name: str) -> str | None:
+        """
+        Resolve an entity name to a valid entity_id.
+
+        Returns ent:XXXXX if the entity already exists in the DB.
+        Returns None if the name cannot be resolved (no entity exists and
+        it doesn't look like an ent: prefixed ID).
+        Unlike _resolve_name_to_entity_id which falls back to the raw string,
+        this method refuses to return an unresolved name to prevent FK violations.
+        """
+        if not name:
+            return None
+        if name.startswith("ent:"):
+            return name  # Already a proper entity ID — trust it
+        entity_id = self.store._resolve_name_to_entity_id(name)
+        if entity_id is not None:
+            return entity_id
+        # Name exists in DB but entity_id returned None — genuinely unresolved
+        return None
+
+    def _link_entities_to_fact(self, fact_id: str, fact_text: str) -> int:
+        """
+        Extract entities from fact_text, upsert to entities table,
+        and link to the fact via fact_entities with role='mentioned'.
+        Returns the number of entities linked.
+        """
+        from hermes_memory_core.dream.entity import extract_entities
+
+        entities = extract_entities(fact_text)
+        linked = 0
+        for entity in entities:
+            entity_id = self.store.upsert_entity(
+                name=entity.name,
+                entity_type=entity.entity_type,
+                aliases=entity.aliases,
+            )
+            try:
+                self.store.upsert_entity_for_fact(fact_id, entity_id, role="mentioned")
+                linked += 1
+            except sqlite3.IntegrityError:
+                # Duplicate link — skip silently
+                pass
+            # G3.4: update entity lifecycle
+            self.store.upsert_lifecycle(entity.name, source_ref=f"fact:{fact_id}")
+        return linked
+
+    def _gc_lifecycle(self) -> None:
+        """Run lifecycle GC at end of dream run: archive stale + GC old entries."""
+        try:
+            self.store.archive_stale_entities(days=30)
+        except Exception as exc:
+            logger.warning("_gc_lifecycle archive_stale_entities failed: %s", exc)
+        try:
+            removed = self.store.gc_entity_lifecycle()
+            if removed:
+                logger.info("_gc_lifecycle removed %d stale entries", removed)
+        except Exception as exc:
+            logger.warning("_gc_lifecycle gc_entity_lifecycle failed: %s", exc)
 
     def _extract_decisions(
         self,
@@ -1047,9 +1241,24 @@ class DreamWorker:
                 self._failed_session_ids.append(session_id)
             return []
         except Exception as exc:
-            logger.warning("extract__extract_decisions failed for session %s: %s", session_id, exc)
+            import requests
+            is_connection_error = isinstance(exc, (
+                LLMTimeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.HTTPError,
+                ConnectionResetError,
+            ))
+            if not is_connection_error:
+                logger.exception("extract__extract_decisions unexpected error: %s", exc)
+                raise
+            logger.warning(
+                "extract__extract_decisions connection error for session %s -- queued for retry: %s",
+                session_id, exc,
+            )
             self._errors.append(f"extract__extract_decisions {session_id}: {exc}")
-            raise  # unexpected -- propagate to _process_session
+            if session_id not in self._failed_session_ids:
+                self._failed_session_ids.append(session_id)
+            return []
 
         decisions: List[Dict[str, Any]] = []
         for item in items:
@@ -1117,9 +1326,24 @@ class DreamWorker:
                 self._failed_session_ids.append(session_id)
             return []
         except Exception as exc:
-            logger.warning("extract__extract_questions failed for session %s: %s", session_id, exc)
+            import requests
+            is_connection_error = isinstance(exc, (
+                LLMTimeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.HTTPError,
+                ConnectionResetError,
+            ))
+            if not is_connection_error:
+                logger.exception("extract__extract_questions unexpected error: %s", exc)
+                raise
+            logger.warning(
+                "extract__extract_questions connection error for session %s -- queued for retry: %s",
+                session_id, exc,
+            )
             self._errors.append(f"extract__extract_questions {session_id}: {exc}")
-            raise  # unexpected -- propagate to _process_session
+            if session_id not in self._failed_session_ids:
+                self._failed_session_ids.append(session_id)
+            return []
 
         questions: List[Dict[str, Any]] = []
         for item in items:
@@ -1396,6 +1620,7 @@ class DreamWorker:
 - Decisions created: {self._decisions_created}
 - Questions created: {self._questions_created}
 - Contradictions detected: {self._contradictions_detected}
+- Entities linked: {self._entities_linked}
 
 ## Errors
 {errors_section}

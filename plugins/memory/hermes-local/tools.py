@@ -6,7 +6,7 @@ Implements the 7 tool interfaces defined in TDD §5.2:
   memory_recent_context, memory_dream_now, fact_feedback
 """
 
-from typing import Any
+from typing import Any, Dict, List
 
 # ── Tool Schemas ─────────────────────────────────────────────────────────────
 
@@ -284,12 +284,26 @@ def _handle_memory_query(params: dict[str, Any]) -> dict[str, Any]:
     limit   = params.get("limit", 10)
     min_score = params.get("min_score", 0.30)
 
-    # ── Structural modes: facts / decisions / open_questions / sessions ─────────
+# Structural modes: facts / decisions / open_questions / sessions ─────────
     if mode in ("facts", "decisions", "open_questions", "sessions"):
         if mode == "facts":
             rows = store.get_facts(project=project, entity=entity, limit=limit)
             formatted = [_format_fact(r) for r in rows]
-            mode_info = {"project": project, "entity": entity}
+            # MEM-016: surface related facts via fact_links
+            related_facts: List[Dict[str, Any]] = []
+            for r in rows:
+                fid = r.get("fact_id")
+                if fid:
+                    for link in store.get_fact_links(fid):
+                        other_id = link["fact_id_a"] if link["fact_id_b"] == fid else link["fact_id_b"]
+                        linked_row = store.get_fact_by_id(other_id)
+                        if linked_row:
+                            related_facts.append({
+                                "fact_id": other_id,
+                                "content": linked_row.get("fact_text", ""),
+                                "link_type": link["link_type"],
+                            })
+            mode_info = {"project": project, "entity": entity, "related_facts": related_facts}
         elif mode == "decisions":
             rows = store.get_decisions(project=project, limit=limit)
             formatted = [_format_decision(r) for r in rows]
@@ -333,14 +347,27 @@ def _handle_memory_query(params: dict[str, Any]) -> dict[str, Any]:
             filtered_hits = [h for h in raw_hits if _score_of(h) >= min_score]
 
             if filtered_hits:
+                # Surface any open questions related to the project being queried.
+                # open_questions table has: question_id, question_text, project,
+                # priority, status, source_refs_json, next_action, created_at, updated_at
+                open_qs = []
+                if project:
+                    rows = store.get_open_questions(project=project, limit=20)
+                    open_qs = [{"question": r.get("question_text", ""),
+                                "asked_at": r.get("created_at", ""),
+                                "entity": project}
+                               for r in rows]
+                mode_info = {
+                    "backend_weights": raw.get("backend_weights") if isinstance(raw, dict) else None,
+                }
+                if open_qs:
+                    mode_info["open_questions"] = open_qs
                 return {
                     "results": [_format_hybrid_hit(h) for h in filtered_hits],
                     "mode": mode,
                     "total": len(filtered_hits),
                     "query": query,
-                    "mode_info": {
-                        "backend_weights": raw.get("backend_weights") if isinstance(raw, dict) else None,
-                    },
+                    "mode_info": mode_info,
                 }
 
             # If we had raw hits but min_score filtered them all out, that's

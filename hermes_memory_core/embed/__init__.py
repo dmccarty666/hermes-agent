@@ -178,6 +178,15 @@ class LMSClient:
                 if response.status_code == 200:
                     data = response.json()
                     embeddings = data["data"]
+                    # Guard against LMS returning fewer embeddings than we sent —
+                    # if the counts mismatch, texts N+1..M silently get [0.0]*768
+                    # via the index walk instead of raising.
+                    if len(embeddings) != len(non_empty_texts):
+                        raise EmbeddingError(
+                            f"LMS returned {len(embeddings)} embeddings for "
+                            f"{len(non_empty_texts)} texts — response was truncated. "
+                            "Split into smaller batches or retry."
+                        )
                     # embeddings are sorted by index in LMS response
                     result: List[List[float]] = []
                     emb_idx = 0

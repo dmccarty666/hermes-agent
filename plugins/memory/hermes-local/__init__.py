@@ -131,6 +131,7 @@ class HermesLocalProvider(MemoryProvider):
         self._session_id: str = ""
         self._hermes_home: Path = _hermes_home()
         self._turn_sequence: int = 0
+        self._seq_lock: "threading.Lock" = threading.Lock()
         # Phase 5 (Epic 5.1.2): narrative thread injection
         self._agent_ref: Optional[Any] = None
         self._nt_first_turn_done: bool = False
@@ -272,7 +273,10 @@ class HermesLocalProvider(MemoryProvider):
         try:
             from hermes_memory_core.search import hybrid as _hybrid
 
-            result = _hybrid.search(query, mode="hybrid", limit=5, memory_db=store)
+            result = _hybrid.search(
+                query, mode="hybrid", limit=5, memory_db=store,
+                filters={"index_status": "indexed"},
+            )
             hits = result.get("results", []) if isinstance(result, dict) else []
             if hits:
                 return self._format_prefetch_hits(hits, source="hybrid")
@@ -283,7 +287,13 @@ class HermesLocalProvider(MemoryProvider):
         try:
             from hermes_memory_core.search.fts5 import fts5_search
 
-            rows = fts5_search(query, filters={}, table="turns", limit=5, memory_db=store)
+            rows = fts5_search(
+                query,
+                filters={"index_status": "indexed"},
+                table="turns",
+                limit=5,
+                memory_db=store,
+            )
             if rows:
                 return self._format_prefetch_hits(rows, source="fts5")
         except Exception as e:
@@ -346,8 +356,9 @@ class HermesLocalProvider(MemoryProvider):
             for role, content in (("user", user_content), ("assistant", assistant_content)):
                 if not content:
                     continue
-                self._turn_sequence += 1
-                turn_id = f"{sid}#t={self._turn_sequence:06d}"
+                with self._seq_lock:
+                    self._turn_sequence += 1
+                    turn_id = f"{sid}#t={self._turn_sequence:06d}"
                 content_hash = _content_hash(content)
                 store.insert_turn_if_not_exists({
                     "turn_id": turn_id,

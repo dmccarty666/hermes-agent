@@ -284,21 +284,31 @@ def _handle_memory_query(params: dict[str, Any]) -> dict[str, Any]:
     limit   = params.get("limit", 10)
     min_score = params.get("min_score", 0.30)
 
-    if mode == "facts":
-        rows = store.get_facts(project=project, entity=entity, limit=limit)
-        return {"mode": "facts", "results": [_format_fact(r) for r in rows]}
-
-    if mode == "decisions":
-        rows = store.get_decisions(project=project, limit=limit)
-        return {"mode": "decisions", "results": [_format_decision(r) for r in rows]}
-
-    if mode == "open_questions":
-        rows = store.get_open_questions(project=project, limit=limit)
-        return {"mode": "open_questions", "results": [_format_question(r) for r in rows]}
-
-    if mode == "sessions":
-        rows = store.get_recent_sessions(limit=limit)
-        return {"mode": "sessions", "results": [_format_session(r) for r in rows]}
+    # ── Structural modes: facts / decisions / open_questions / sessions ─────────
+    if mode in ("facts", "decisions", "open_questions", "sessions"):
+        if mode == "facts":
+            rows = store.get_facts(project=project, entity=entity, limit=limit)
+            formatted = [_format_fact(r) for r in rows]
+            mode_info = {"project": project, "entity": entity}
+        elif mode == "decisions":
+            rows = store.get_decisions(project=project, limit=limit)
+            formatted = [_format_decision(r) for r in rows]
+            mode_info = {"project": project}
+        elif mode == "open_questions":
+            rows = store.get_open_questions(project=project, limit=limit)
+            formatted = [_format_question(r) for r in rows]
+            mode_info = {"project": project}
+        else:  # sessions
+            rows = store.get_recent_sessions(limit=limit)
+            formatted = [_format_session(r) for r in rows]
+            mode_info = {}
+        return {
+            "results": formatted,
+            "mode": mode,
+            "total": len(formatted),
+            "query": query,
+            "mode_info": mode_info,
+        }
 
     # Semantic / hybrid — real embedding-based search via the hybrid module.
     # If hybrid returns empty (no Qdrant points yet, or merge-logic bug), fall
@@ -324,9 +334,13 @@ def _handle_memory_query(params: dict[str, Any]) -> dict[str, Any]:
 
             if filtered_hits:
                 return {
-                    "mode": mode,
                     "results": [_format_hybrid_hit(h) for h in filtered_hits],
-                    "backend_weights": raw.get("backend_weights") if isinstance(raw, dict) else None,
+                    "mode": mode,
+                    "total": len(filtered_hits),
+                    "query": query,
+                    "mode_info": {
+                        "backend_weights": raw.get("backend_weights") if isinstance(raw, dict) else None,
+                    },
                 }
 
             # If we had raw hits but min_score filtered them all out, that's
@@ -334,9 +348,13 @@ def _handle_memory_query(params: dict[str, Any]) -> dict[str, Any]:
             # Do NOT fall back to keyword scan in this case.
             if raw_hits:
                 return {
-                    "mode": mode,
                     "results": [],
-                    "note": f"no results above min_score={min_score:.2f} (lower threshold or rephrase query)",
+                    "mode": mode,
+                    "total": 0,
+                    "query": query,
+                    "mode_info": {
+                        "note": f"no results above min_score={min_score:.2f} (lower threshold or rephrase query)",
+                    },
                 }
 
             # raw_hits was empty — Qdrant likely has no points yet. Fall back
@@ -348,16 +366,24 @@ def _handle_memory_query(params: dict[str, Any]) -> dict[str, Any]:
                           if q_lower in (r.get("fact_text") or "").lower()]
             if kw_matched:
                 return {
-                    "mode": mode,
-                    "fallback": "keyword",
-                    "note": f"{mode} returned 0 hits (Qdrant points=0?); keyword substring matched {len(kw_matched)}",
                     "results": kw_matched[:limit],
+                    "mode": mode,
+                    "total": len(kw_matched[:limit]),
+                    "query": query,
+                    "mode_info": {
+                        "fallback": "keyword",
+                        "note": f"{mode} returned 0 hits (Qdrant points=0?); keyword substring matched {len(kw_matched)}",
+                    },
                 }
             return {
-                "mode": mode,
-                "fallback": "none",
-                "note": f"{mode} returned 0 hits; keyword found nothing — query likely unrelated to stored memory",
                 "results": [],
+                "mode": mode,
+                "total": 0,
+                "query": query,
+                "mode_info": {
+                    "fallback": "none",
+                    "note": f"{mode} returned 0 hits; keyword found nothing — query likely unrelated to stored memory",
+                },
             }
         except Exception as e:
             # Last-resort: keyword substring scan
@@ -365,7 +391,16 @@ def _handle_memory_query(params: dict[str, Any]) -> dict[str, Any]:
             q_lower = query.lower()
             matched = [_format_fact(r) for r in facts
                        if q_lower in (r.get("fact_text") or "").lower()]
-            return {"mode": mode, "fallback": "keyword", "error": str(e), "results": matched[:limit]}
+            return {
+                "results": matched[:limit],
+                "mode": mode,
+                "total": len(matched[:limit]),
+                "query": query,
+                "mode_info": {
+                    "fallback": "keyword",
+                    "error": str(e),
+                },
+            }
 
     # Keyword — simple substring scan over facts + decisions
     if mode == "keyword":
@@ -377,11 +412,25 @@ def _handle_memory_query(params: dict[str, Any]) -> dict[str, Any]:
         matched_decisions = [_format_decision(r) for r in decisions
                              if q_lower in (r.get("decision_text") or "").lower()]
         combined = matched_facts + matched_decisions
-        return {"mode": mode, "results": combined[:limit]}
+        limited = combined[:limit]
+        return {
+            "results": limited,
+            "mode": mode,
+            "total": len(limited),
+            "query": query,
+            "mode_info": {"sources": ["facts", "decisions"]},
+        }
 
     # Unknown mode — return recent facts as a safe default
     rows = store.get_facts(project=project, limit=limit)
-    return {"mode": mode, "fallback": "facts", "results": [_format_fact(r) for r in rows]}
+    formatted = [_format_fact(r) for r in rows]
+    return {
+        "results": formatted,
+        "mode": mode,
+        "total": len(formatted),
+        "query": query,
+        "mode_info": {"fallback": "facts"},
+    }
 
 
 def _handle_memory_write(params: dict[str, Any]) -> dict[str, Any]:

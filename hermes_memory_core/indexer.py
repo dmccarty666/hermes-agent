@@ -259,7 +259,8 @@ def _index_session(
             collection_name=collection_name,
             points=points,
         )
-        result.indexed += len(turns)
+        # NOTE: do NOT increment result.indexed here — SQLite may still fail.
+        # Count is incremented only after both backends succeed (see below).
     except Exception as exc:
         logger.error("Qdrant upsert failed for session %s: %s", turns[0]["session_id"], exc)
         result.errors.append(f"Qdrant upsert failed: {exc}")
@@ -267,6 +268,7 @@ def _index_session(
 
     # 2f. Persist chunks into SQLite chunks table (idempotent via INSERT OR REPLACE
     # on chunk_id PK; UNIQUE(text_hash, embed_model) guards content duplicates).
+    sqlite_ok = True
     if memory_db is not None and sqlite_rows:
         try:
             conn = memory_db._connect()
@@ -285,7 +287,18 @@ def _index_session(
         except Exception as exc:
             logger.error("SQLite chunks insert failed for session %s: %s", turns[0]["session_id"], exc)
             result.errors.append(f"SQLite chunks insert failed: {exc}")
-            # Don't fail the whole batch — Qdrant has the data; sqlite is best-effort
+            # Mark turns so they are re-tried on next indexer run.
+            # Qdrant has the data; SQLite metadata is the gap.
+            sqlite_ok = False
+
+    if sqlite_ok:
+        # Only count as indexed when both Qdrant AND SQLite succeeded.
+        result.indexed += len(turns)
+    else:
+        # Qdrant succeeded but SQLite failed — return all turns so they are
+        # marked 'partial' (pending retry). Do NOT return empty set which
+        # would cause _update_turn_statuses to mark them 'indexed' wrongly.
+        return {t["turn_id"] for t in turns}
 
     return failed
 
@@ -355,6 +368,9 @@ class IndexerWorker:
         qdrant_client: Optional[QdrantClient] = None,
         collection_name: str = _DEFAULT_COLLECTION,
         gateway_url: Optional[str] = None,
+        failure_threshold: int = 3,
+        base_interval: float = 15.0,
+        max_interval: float = 300.0,
     ) -> None:
         self.memory_db = memory_db
         self.poll_interval = poll_interval
@@ -363,6 +379,12 @@ class IndexerWorker:
         self.qdrant_client = qdrant_client or QdrantClient(host="localhost", port=6333, timeout=10)
         self.collection_name = collection_name
         self.gateway_url = gateway_url
+
+        # Circuit breaker parameters
+        self.failure_threshold = failure_threshold
+        self.base_interval = base_interval
+        self.max_interval = max_interval
+        self.consecutive_failures = 0
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -401,15 +423,40 @@ class IndexerWorker:
         """Poll loop — runs in background thread."""
         while not self._stop_event.is_set():
             try:
-                batch_index(
+                result = batch_index(
                     self.memory_db,
                     batch_size=self.batch_size,
                     embed_client=self.embed_client,
                     qdrant_client=self.qdrant_client,
                     collection_name=self.collection_name,
                 )
+                # Circuit breaker: check for failures
+                if result.errors or result.failed > 0:
+                    self.consecutive_failures += 1
+                    if self.consecutive_failures >= self.failure_threshold:
+                        self.poll_interval = min(self.poll_interval * 2, self.max_interval)
+                        logger.warning(
+                            "Circuit breaker open, backing off to %.1fs (failures=%d)",
+                            self.poll_interval, self.consecutive_failures,
+                        )
+                else:
+                    # Success: reset circuit breaker
+                    if self.consecutive_failures >= self.failure_threshold:
+                        logger.info(
+                            "Circuit breaker closed, resuming normal polling (was %.1fs)",
+                            self.poll_interval,
+                        )
+                    self.consecutive_failures = 0
+                    self.poll_interval = self.base_interval
             except Exception as exc:
                 logger.exception("IndexerWorker batch_index raised: %s", exc)
+                self.consecutive_failures += 1
+                if self.consecutive_failures >= self.failure_threshold:
+                    self.poll_interval = min(self.poll_interval * 2, self.max_interval)
+                    logger.warning(
+                        "Circuit breaker open, backing off to %.1fs (failures=%d)",
+                        self.poll_interval, self.consecutive_failures,
+                    )
 
             # Wait for next poll or stop signal
             self._stop_event.wait(timeout=self.poll_interval)

@@ -41,6 +41,71 @@ def _reload_semantic_search():
 
 
 # -------------------------------------------------------------------------- #
+# PageRank entity centrality cache
+# ---------------------------------------------------------------------------#
+
+# Module-level cache for entity pagerank scores (lazy, TTL-based expiry)
+_pagerank_cache: dict[str, float] | None = None
+_pagerank_cache_time: float | None = None  # monotonic timestamp when cache was built
+
+_PAGERANK_CACHE_TTL: float = 300.0  # seconds (5 minutes)
+
+
+def _get_entity_pagerank(entity_name: str) -> float:
+    """Return cached PageRank score for an entity name, or 0.0 if unknown.
+
+    The cache is populated on first call and expires after _PAGERANK_CACHE_TTL
+    seconds (default 5 min), after which it is rebuilt on the next access.
+    """
+    global _pagerank_cache, _pagerank_cache_time
+    import time
+    now = time.monotonic()
+    if _pagerank_cache is not None and _pagerank_cache_time is not None:
+        if now - _pagerank_cache_time < _PAGERANK_CACHE_TTL:
+            return _pagerank_cache.get(entity_name, 0.0)
+    # Cache miss or expired — recompute
+    from hermes_memory_core.dream.graph import EntityGraph
+    from hermes_memory_core.store.sqlite import get_memory_store
+    from pathlib import Path
+    try:
+        store = get_memory_store(Path.home() / ".hermes/memory/index/memory.sqlite")
+        eg = EntityGraph(store)
+        ranked = eg.page_rank(top_k=500)
+        _pagerank_cache = {name: score for name, score in ranked}
+        _pagerank_cache_time = now
+    except Exception:
+        _pagerank_cache = {}
+        _pagerank_cache_time = now
+    return _pagerank_cache.get(entity_name, 0.0)
+
+
+def _compute_centrality_boost(
+    store, chunk_id: str, centrality_weight: float = 0.05
+) -> float:
+    """Get the max PageRank score of any entity linked to this fact.
+
+    Queries fact_entities for all entities in this fact, looks up each entity's
+    PageRank, returns the max multiplied by centrality_weight.
+    Returns 0.0 if no linked entities or on error.
+    """
+    if centrality_weight <= 0:
+        return 0.0
+    try:
+        conn = store._connect()
+        entity_ids = conn.execute(
+            "SELECT e.name FROM fact_entities fe JOIN entities e ON fe.entity_id = e.entity_id WHERE fe.fact_id = ?",
+            (chunk_id,),
+        ).fetchall()
+        conn.close()
+        if not entity_ids:
+            return 0.0
+        scores = [_get_entity_pagerank(name) for (name,) in entity_ids]
+        return centrality_weight * max(scores)
+    except Exception:
+        return 0.0
+
+
+# -------------------------------------------------------------------------- #
 # Mode weight tables (exposed for tests)
 # ---------------------------------------------------------------------------#
 
@@ -345,8 +410,12 @@ def _score(
     freshness: float,
     mode: str,
     weights: Optional[Dict[str, float]] = None,
+    centrality_boost: float = 0.0,
 ) -> float:
-    """Compute weighted combined score = sum(w * norm) * trust * freshness."""
+    """Compute weighted combined score = sum(w * norm) * trust * freshness.
+
+    centrality_boost is added to the relevance before trust/freshness scaling.
+    """
     if weights is None:
         weights = _MODE_WEIGHTS.get(mode, _DEFAULT_WEIGHTS)
     relevance = (
@@ -355,6 +424,7 @@ def _score(
         + weights["jaccard"] * jaccard_sim
         + weights["hrr"]     * hrr_sim
     )
+    relevance += centrality_boost
     return relevance * trust_score * freshness
 
 
@@ -401,6 +471,7 @@ def _dedup_results(
         raw_score = hit.get("rank", 0.0)
         fts_norm = _normalize_bm25(raw_score)
         updated_at = hit.get("timestamp")
+        fts_table = hit.get("_fts_table", "chunks")
 
         key = _content_hash(content)
         if key not in candidates:
@@ -415,7 +486,7 @@ def _dedup_results(
                 hrr_score=0.0,
                 backend_hits=["fts"],
                 source_ref=source_ref,
-                metadata={"timestamp": updated_at, "backend": "fts"},
+                metadata={"timestamp": updated_at, "backend": "fts", "fts_table": fts_table},
             )
         else:
             existing = candidates[key]
@@ -545,6 +616,11 @@ def search(
         result.freshness_decay = freshness_decay(
             result.metadata.get("timestamp") or result.metadata.get("date")
         )
+        # Compute centrality boost for facts with linked entities
+        centrality_boost = 0.0
+        if memory_db is not None and result.metadata.get("fts_table") == "facts":
+            centrality_boost = _compute_centrality_boost(memory_db, result.chunk_id)
+            result.metadata["centrality_boost"] = centrality_boost
         result.score = _score(
             fts_norm=result.fts_score,
             qdrant_norm=result.qdrant_score,
@@ -554,6 +630,7 @@ def search(
             freshness=result.freshness_decay,
             mode=mode,
             weights=effective_weights,
+            centrality_boost=centrality_boost,
         )
         scored.append(result)
 

@@ -12,6 +12,7 @@ import logging
 import os
 import sqlite3
 import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -133,21 +134,42 @@ CREATE INDEX IF NOT EXISTS idx_facts_project ON facts(project);
 CREATE INDEX IF NOT EXISTS idx_facts_status  ON facts(status);
 CREATE INDEX IF NOT EXISTS idx_facts_entity  ON facts(entity);
 
--- entities
+-- entities (unified schema — canonical: MemoryDB)
 CREATE TABLE IF NOT EXISTS entities (
-  entity_id   INTEGER PRIMARY KEY AUTOINCREMENT,
-  name        TEXT NOT NULL,
-  entity_type TEXT DEFAULT 'unknown',
-  aliases     TEXT DEFAULT '',
-  created_at  TEXT NOT NULL
+  entity_id     TEXT PRIMARY KEY,
+  name          TEXT NOT NULL,
+  alias_json    TEXT DEFAULT '[]',
+  entity_type   TEXT,
+  entity_subtype TEXT,
+  project       TEXT,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name);
+CREATE INDEX IF NOT EXISTS idx_entities_name    ON entities(name);
+CREATE INDEX IF NOT EXISTS idx_entities_project ON entities(project);
 
+-- fact_entities (unified schema — canonical: MemoryDB)
 CREATE TABLE IF NOT EXISTS fact_entities (
-  fact_id   TEXT REFERENCES facts(fact_id),
-  entity_id INTEGER REFERENCES entities(entity_id),
-  PRIMARY KEY (fact_id, entity_id)
+  fact_id   TEXT NOT NULL,
+  entity_id TEXT NOT NULL REFERENCES entities(entity_id),
+  role      TEXT DEFAULT 'mentioned',
+  PRIMARY KEY (fact_id, entity_id, role)
 );
+
+-- entity_relations (new graph edge table)
+CREATE TABLE IF NOT EXISTS entity_relations (
+  relation_id       TEXT PRIMARY KEY,
+  source_entity_id  TEXT NOT NULL REFERENCES entities(entity_id),
+  target_entity_id  TEXT NOT NULL REFERENCES entities(entity_id),
+  relation_type     TEXT NOT NULL,
+  source_ref        TEXT,
+  confidence        REAL DEFAULT 0.5,
+  created_at        TEXT NOT NULL,
+  UNIQUE(source_entity_id, target_entity_id, relation_type)
+);
+CREATE INDEX IF NOT EXISTS idx_relations_source ON entity_relations(source_entity_id);
+CREATE INDEX IF NOT EXISTS idx_relations_target ON entity_relations(target_entity_id);
+CREATE INDEX IF NOT EXISTS idx_relations_type   ON entity_relations(relation_type);
 
 -- decisions
 CREATE TABLE IF NOT EXISTS decisions (
@@ -229,6 +251,18 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
 
+-- entity lifecycle (G3.4)
+CREATE TABLE IF NOT EXISTS entity_lifecycle (
+    entity_name   TEXT PRIMARY KEY,
+    status        TEXT NOT NULL DEFAULT 'active',
+    first_seen_at TEXT NOT NULL,
+    last_seen_at  TEXT NOT NULL,
+    archived_at   TEXT,
+    revived_at    TEXT,
+    mention_count INTEGER DEFAULT 1,
+    source_ref    TEXT DEFAULT ''
+);
+
 -- FTS5 virtual tables (all auto-synced via triggers)
 CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
   content, session_id UNINDEXED, turn_id UNINDEXED, project UNINDEXED, timestamp UNINDEXED,
@@ -297,18 +331,75 @@ class MemoryStore:
             DB_DIR.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(str(self._db_path), timeout=30.0, isolation_level=None)
             conn.execute("PRAGMA journal_mode=WAL")
+            # Verify WAL actually took — some filesystems (NFS, docker overlay)
+            # silently reject WAL and fall back to rollback mode, which allows
+            # concurrent writes to corrupt data. Detect this immediately.
+            cur = conn.execute("PRAGMA journal_mode")
+            mode = cur.fetchone()[0]
+            if mode != "wal":
+                raise RuntimeError(
+                    f"WAL mode requested but filesystem returned '{mode}'. "
+                    "Concurrent writes may corrupt data. Check filesystem capabilities "
+                    "or switch to a native filesystem for the memory DB path."
+                )
             conn.execute("PRAGMA foreign_keys=ON")
             conn.executescript(_SCHEMA_SQL)
-            # Migration: add trust_score column to pre-existing DBs that lack it
+
+            # ── Idempotent migrations for pre-existing DBs ─────────────────────
+            # These ALTER TABLE statements are safe to re-run: SQLite raises
+            # OperationalError when the column already exists (or the table
+            # doesn't yet), which we swallow.
+            _migrations = (
+                # entities: add missing columns from unified schema
+                "ALTER TABLE entities ADD COLUMN alias_json TEXT DEFAULT '[]'",
+                "ALTER TABLE entities ADD COLUMN entity_subtype TEXT",
+                "ALTER TABLE entities ADD COLUMN project TEXT",
+                "ALTER TABLE entities ADD COLUMN updated_at TEXT",
+                # facts: trust_score (was missing in some versions)
+                "ALTER TABLE facts ADD COLUMN trust_score REAL DEFAULT 0.5",
+                # fact_entities: add role column
+                "ALTER TABLE fact_entities ADD COLUMN role TEXT DEFAULT 'mentioned'",
+            )
+            for stmt in _migrations:
+                try:
+                    conn.execute(stmt)
+                except sqlite3.OperationalError:
+                    pass  # column already exists or table freshly created
+
+            # Ensure entity_relations exists (may already exist from _SCHEMA_SQL)
             try:
-                conn.execute("ALTER TABLE facts ADD COLUMN trust_score REAL DEFAULT 0.5")
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS entity_relations ("
+                    "  relation_id       TEXT PRIMARY KEY,"
+                    "  source_entity_id TEXT NOT NULL REFERENCES entities(entity_id),"
+                    "  target_entity_id TEXT NOT NULL REFERENCES entities(entity_id),"
+                    "  relation_type    TEXT NOT NULL,"
+                    "  source_ref       TEXT,"
+                    "  confidence       REAL DEFAULT 0.5,"
+                    "  created_at       TEXT NOT NULL,"
+                    "  UNIQUE(source_entity_id, target_entity_id, relation_type)"
+                    ")"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_relations_source "
+                    "ON entity_relations(source_entity_id)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_relations_target "
+                    "ON entity_relations(target_entity_id)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_relations_type "
+                    "ON entity_relations(relation_type)"
+                )
             except sqlite3.OperationalError:
-                pass  # column already exists or table freshly created
+                pass  # table already exists
+
             # Record schema version
             try:
                 conn.execute(
                     "INSERT INTO schema_version VALUES (?, ?, ?)",
-                    (_utc_now(), 1, "initial v0.2 schema"),
+                    (_utc_now(), 2, "unified entity/fact_entities schema + entity_relations"),
                 )
             except sqlite3.IntegrityError:
                 pass  # already initialized
@@ -318,8 +409,11 @@ class MemoryStore:
 
     def _conn_or_init(self) -> sqlite3.Connection:
         self._ensure_init()
-        assert self._conn is not None
-        return self._conn
+        with self._lock:
+            # Re-check after acquiring the lock: another thread may have
+            # called close() between our first check and acquiring the lock.
+            assert self._conn is not None, "connection was closed during _conn_or_init"
+            return self._conn
 
     def _connect(self) -> sqlite3.Connection:
         """Return a short-lived raw connection.
@@ -335,10 +429,16 @@ class MemoryStore:
         ``MemoryStore`` (e.g. via ``get_memory_store()``) still works without
         having to know which concrete subclass it holds.
         """
-        self._ensure_init()
+        # Skip _ensure_init() — self._conn may be closed (caller closed it).
+        # _connect() returns a brand-new independent connection; callers are
+        # responsible for closing it. The store's owned conn does not need to be
+        # flushed because we don't use it here.
         owned = getattr(self, "_conn", None)
-        if owned is not None and owned.in_transaction:
-            owned.commit()
+        try:
+            if owned is not None and not owned.in_transaction:
+                owned.commit()
+        except sqlite3.Error:
+            pass  # owned conn was closed or otherwise unusable; ignore
         return sqlite3.connect(str(self._db_path), timeout=30.0)
 
     def close(self) -> None:
@@ -518,6 +618,8 @@ class MemoryStore:
         confidence: float | None = None,
         tags_json: str = "[]",
         supersedes_fact_id: str | None = None,
+        entity_id: str | None = None,
+        entity_role: str = "mentioned",
     ) -> Tuple[str, bool]:
         """
         Insert or update a fact.
@@ -526,6 +628,9 @@ class MemoryStore:
         Otherwise insert and return (fact_id, True).
 
         When supersedes_fact_id is provided, the superseded fact is marked disputed.
+
+        When entity_id is provided, a link is created in fact_entities with the
+        specified role (default 'mentioned').
         """
         conn = self._conn_or_init()
         now = _utc_now()
@@ -563,6 +668,15 @@ class MemoryStore:
                 source_refs_json, tags_json, supersedes_fact_id,
             ),
         )
+
+        # Link entity to fact if entity_id provided
+        if entity_id:
+            conn.execute(
+                """INSERT INTO fact_entities (fact_id, entity_id, role)
+                   VALUES (?, ?, ?)""",
+                (fact_id, entity_id, entity_role),
+            )
+
         return fact_id, True
 
     def get_facts_for_contradiction_check(
@@ -615,6 +729,156 @@ class MemoryStore:
             return None
         cols = [c[0] for c in conn.execute("PRAGMA table_info(facts)").fetchall()]
         return dict(zip(cols, row))
+
+    # ── entity-fact links ───────────────────────────────────────────────────────
+
+    def upsert_entity_for_fact(
+        self,
+        fact_id: str,
+        entity_id: str,
+        role: str = "mentioned",
+    ) -> None:
+        """
+        Link an entity to a fact with the specified role.
+
+        The (fact_id, entity_id, role) combination must be unique; duplicates raise
+        IntegrityError.
+        """
+        conn = self._conn_or_init()
+        conn.execute(
+            """INSERT INTO fact_entities (fact_id, entity_id, role)
+               VALUES (?, ?, ?)""",
+            (fact_id, entity_id, role),
+        )
+
+    def upsert_entity(
+        self,
+        name: str,
+        entity_type: str = "unknown",
+        aliases: List[str] | None = None,
+        project: str | None = None,
+    ) -> str:
+        """
+        Insert or update an entity by name (case-insensitive dedup).
+        Returns the entity_id (TEXT primary key).
+        """
+        conn = self._conn_or_init()
+        now = _utc_now()
+        aliases = aliases if aliases is not None else []
+        alias_json = json.dumps(aliases)
+
+        # Case-insensitive lookup
+        row = conn.execute(
+            "SELECT entity_id FROM entities WHERE LOWER(name)=LOWER(?)",
+            (name,),
+        ).fetchone()
+
+        if row:
+            entity_id = row[0]
+            conn.execute(
+                """UPDATE entities
+                   SET alias_json = ?, entity_type = ?, updated_at = ?
+                   WHERE entity_id = ?""",
+                (alias_json, entity_type, now, entity_id),
+            )
+            return entity_id
+        else:
+            entity_id = f"ent:{uuid.uuid4().hex[:16]}"
+            conn.execute(
+                """INSERT INTO entities
+                   (entity_id, name, alias_json, entity_type, project, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (entity_id, name, alias_json, entity_type, project, now, now),
+            )
+            return entity_id
+
+    def _resolve_name_to_entity_id(self, name: str) -> str | None:
+        """
+        Resolve an entity name to its entity_id.
+
+        Returns the entity_id if found, or None if no entity with that name exists.
+        """
+        conn = self._conn_or_init()
+        row = conn.execute(
+            "SELECT entity_id FROM entities WHERE LOWER(name)=LOWER(?)",
+            (name,),
+        ).fetchone()
+        return row[0] if row else None
+
+    def upsert_entity_relation(
+        self,
+        relation_id: str,
+        source_entity_id: str,
+        target_entity_id: str,
+        relation_type: str,
+        source_ref: str | None = None,
+        confidence: float = 0.5,
+    ) -> Dict[str, Any]:
+        """
+        Insert or update an entity relation.
+
+        If (source_entity_id, target_entity_id, relation_type) already exists,
+        returns the existing row without inserting. Otherwise inserts and returns
+        the new row.
+        """
+        conn = self._conn_or_init()
+        now = _utc_now()
+
+        # Check for existing relation
+        existing = conn.execute(
+            """SELECT relation_id, source_entity_id, target_entity_id,
+                      relation_type, source_ref, confidence, created_at
+               FROM entity_relations
+               WHERE source_entity_id = ? AND target_entity_id = ? AND relation_type = ?""",
+            (source_entity_id, target_entity_id, relation_type),
+        ).fetchone()
+
+        if existing:
+            cols = ["relation_id", "source_entity_id", "target_entity_id",
+                    "relation_type", "source_ref", "confidence", "created_at"]
+            return dict(zip(cols, existing))
+
+        conn.execute(
+            """INSERT INTO entity_relations (relation_id, source_entity_id, target_entity_id,
+                                             relation_type, source_ref, confidence, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (relation_id, source_entity_id, target_entity_id, relation_type,
+             source_ref, confidence, now),
+        )
+        return {
+            "relation_id": relation_id,
+            "source_entity_id": source_entity_id,
+            "target_entity_id": target_entity_id,
+            "relation_type": relation_type,
+            "source_ref": source_ref,
+            "confidence": confidence,
+            "created_at": now,
+        }
+
+    def get_entity_relations(
+        self,
+        entity_id: str,
+        relation_type: str | None = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch all relations involving an entity (as source or target).
+
+        If relation_type is provided, filter to that type only.
+        """
+        conn = self._conn_or_init()
+        sql = """SELECT relation_id, source_entity_id, target_entity_id,
+                        relation_type, source_ref, confidence, created_at
+                 FROM entity_relations
+                 WHERE source_entity_id = ? OR target_entity_id = ?"""
+        args: list[Any] = [entity_id, entity_id]
+        if relation_type:
+            sql += " AND relation_type = ?"
+            args.append(relation_type)
+        sql += " ORDER BY created_at"
+        rows = conn.execute(sql, args).fetchall()
+        cols = ["relation_id", "source_entity_id", "target_entity_id",
+                "relation_type", "source_ref", "confidence", "created_at"]
+        return [dict(zip(cols, row)) for row in rows]
 
     # ── decisions ──────────────────────────────────────────────────────────
 
@@ -838,7 +1102,131 @@ class MemoryStore:
             args,
         )
 
-    # ── audit ────────────────────────────────────────────────────────────────
+    # ── entity lifecycle (G3.4) ─────────────────────────────────────────────────
+
+    def upsert_lifecycle(self, entity_name: str, source_ref: str = "") -> None:
+        """
+        Insert or update an entity lifecycle record.
+
+        - If entity is new: insert with status='active'
+        - If entity exists and status='archived': transition to 'revived'
+        - Always update last_seen_at and increment mention_count
+        """
+        conn = self._conn_or_init()
+        now = _utc_now()
+
+        existing = conn.execute(
+            "SELECT status, mention_count FROM entity_lifecycle WHERE entity_name = ?",
+            (entity_name,),
+        ).fetchone()
+
+        if existing:
+            old_status = existing[0]
+            new_status = "revived" if old_status == "archived" else old_status
+            revived_at = now if new_status == "revived" else None
+            conn.execute(
+                """UPDATE entity_lifecycle
+                   SET last_seen_at = ?, mention_count = mention_count + 1,
+                       status = ?, revived_at = COALESCE(?, revived_at),
+                       source_ref = COALESCE(NULLIF(?, ''), source_ref)
+                   WHERE entity_name = ?""",
+                (now, new_status, revived_at, source_ref, entity_name),
+            )
+        else:
+            conn.execute(
+                """INSERT INTO entity_lifecycle
+                   (entity_name, status, first_seen_at, last_seen_at, mention_count, source_ref)
+                   VALUES (?, 'active', ?, ?, 1, ?)""",
+                (entity_name, now, now, source_ref),
+            )
+
+    def archive_stale_entities(self, days: int = 30) -> int:
+        """
+        Mark entities as 'archived' if not seen in the last `days` days.
+        Returns the number of entities archived.
+        """
+        conn = self._conn_or_init()
+        now = _utc_now()
+
+        # Archive entities with last_seen_at older than `days` days that are still 'active'
+        cutoff = conn.execute(
+            "SELECT datetime(?, '-' || ? || ' days')",
+            (now, str(days)),
+        ).fetchone()[0]
+
+        cursor = conn.execute(
+            """UPDATE entity_lifecycle
+               SET status = 'archived', archived_at = ?
+               WHERE status = 'active' AND last_seen_at < ?""",
+            (now, cutoff),
+        )
+        return cursor.rowcount
+
+    def get_active_entities(self, limit: int = 20) -> List[str]:
+        """Return entity names with status='active' ordered by last_seen_at desc."""
+        conn = self._conn_or_init()
+        rows = conn.execute(
+            """SELECT entity_name FROM entity_lifecycle
+               WHERE status = 'active'
+               ORDER BY last_seen_at DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def get_archived_entities(self, limit: int = 20) -> List[str]:
+        """Return entity names with status='archived' ordered by archived_at desc."""
+        conn = self._conn_or_init()
+        rows = conn.execute(
+            """SELECT entity_name FROM entity_lifecycle
+               WHERE status = 'archived'
+               ORDER BY archived_at DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def get_revived_entities(self, limit: int = 20) -> List[str]:
+        """Return entity names with status='revived' (revived within last 7 days)."""
+        conn = self._conn_or_init()
+        from datetime import datetime, timezone, timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        rows = conn.execute(
+            """SELECT entity_name FROM entity_lifecycle
+               WHERE status = 'revived' AND revived_at > ?
+               ORDER BY revived_at DESC LIMIT ?""",
+            (cutoff, limit),
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def get_entities_by_status(
+        self, status: str, limit: int = 20
+    ) -> List[Dict[str, Any]]:
+        """Return full lifecycle rows for a given status."""
+        conn = self._conn_or_init()
+        rows = conn.execute(
+            """SELECT entity_name, status, first_seen_at, last_seen_at,
+                      archived_at, revived_at, mention_count, source_ref
+               FROM entity_lifecycle WHERE status = ?
+               ORDER BY last_seen_at DESC LIMIT ?""",
+            (status, limit),
+        ).fetchall()
+        cols = ["entity_name", "status", "first_seen_at", "last_seen_at",
+                "archived_at", "revived_at", "mention_count", "source_ref"]
+        return [dict(zip(cols, row)) for row in rows]
+
+    def gc_entity_lifecycle(self) -> int:
+        """
+        Remove entity lifecycle entries older than 365 days.
+        Returns the number of rows deleted.
+        """
+        conn = self._conn_or_init()
+        now = conn.execute("SELECT datetime('now', '-365 days')").fetchone()[0]
+        cursor = conn.execute(
+            "DELETE FROM entity_lifecycle WHERE last_seen_at < ?",
+            (now,),
+        )
+        return cursor.rowcount
+
+  # ── audit ────────────────────────────────────────────────────────────────
 
     def write_audit(
         self,
@@ -982,16 +1370,50 @@ class MemoryDB(MemoryStore):
             # idempotent — sqlite raises OperationalError when the column
             # already exists (or the table doesn't yet), which we swallow.
             _pre_schema_migrations = (
+                # entities: add missing columns from unified schema
                 "ALTER TABLE entities ADD COLUMN project TEXT",
                 "ALTER TABLE entities ADD COLUMN alias_json TEXT",
+                "ALTER TABLE entities ADD COLUMN entity_subtype TEXT",
                 "ALTER TABLE entities ADD COLUMN updated_at TEXT",
+                # facts: trust_score (was missing in some versions)
                 "ALTER TABLE facts ADD COLUMN trust_score REAL DEFAULT 0.5",
+                # fact_entities: add role column
+                "ALTER TABLE fact_entities ADD COLUMN role TEXT DEFAULT 'mentioned'",
             )
             for stmt in _pre_schema_migrations:
                 try:
                     conn.execute(stmt)
                 except sqlite3.OperationalError:
                     pass  # column already exists or table not yet created
+
+            # Ensure entity_relations exists (may already exist from _FULL_SCHEMA)
+            try:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS entity_relations ("
+                    "  relation_id       TEXT PRIMARY KEY,"
+                    "  source_entity_id TEXT NOT NULL REFERENCES entities(entity_id),"
+                    "  target_entity_id TEXT NOT NULL REFERENCES entities(entity_id),"
+                    "  relation_type    TEXT NOT NULL,"
+                    "  source_ref       TEXT,"
+                    "  confidence       REAL DEFAULT 0.5,"
+                    "  created_at       TEXT NOT NULL,"
+                    "  UNIQUE(source_entity_id, target_entity_id, relation_type)"
+                    ")"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_relations_source "
+                    "ON entity_relations(source_entity_id)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_relations_target "
+                    "ON entity_relations(target_entity_id)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_relations_type "
+                    "ON entity_relations(relation_type)"
+                )
+            except sqlite3.OperationalError:
+                pass  # table already exists
             conn.executescript(_FULL_SCHEMA_MEMORY_DB)
             self._conn = conn
             self._initialized = True

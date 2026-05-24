@@ -144,7 +144,7 @@ class ScoredResult:
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to a plain dict for API responses."""
-        return {
+        result = {
             "chunk_id": self.chunk_id,
             "session_id": self.session_id,
             "content": self.content,
@@ -161,6 +161,10 @@ class ScoredResult:
                 **self.metadata,
             },
         }
+        # MEM-016: surface fact_links adjacency
+        if self.metadata.get("linked_fact_ids"):
+            result["linked_fact_ids"] = self.metadata["linked_fact_ids"]
+        return result
 
 
 # -------------------------------------------------------------------------- #
@@ -684,6 +688,11 @@ def search(
         )
         scored.append(result)
 
+    # MEM-016: cross-fact adjacency boost — for facts, look up linked fact IDs
+    # and boost the score of any linked facts that are also in the result set.
+    if memory_db is not None:
+        _apply_fact_links_boost(scored, memory_db)
+
     deduped = _deduplicate(scored)
     deduped.sort(key=lambda r: r.score, reverse=True)
     results_out = [r.to_dict() for r in deduped[:limit]]
@@ -698,7 +707,52 @@ def search(
     }
 
 
-# Alias for backwards compatibility
+# -------------------------------------------------------------------------- #
+# Fact-links adjacency boost (MEM-016)
+# -------------------------------------------------------------------------- #
+
+_FACT_LINKS_BOOST: float = 0.10  # score boost for linked facts already in results
+
+
+def _apply_fact_links_boost(scored: List[ScoredResult], memory_db: Any) -> None:
+    """Boost the score of facts that are linked to other facts in the result set.
+
+    For each fact result, look up its fact_links entries and boost the score
+    of any linked facts that are also present in ``scored``.  Also writes
+    ``linked_fact_ids`` into each result's metadata so the result schema
+    surfaces cross-fact adjacency to callers.
+    """
+    # Build a quick lookup from fact_id → ScoredResult (only for facts rows)
+    id_to_result: Dict[str, ScoredResult] = {}
+    for r in scored:
+        if r.metadata.get("fts_table") == "facts":
+            id_to_result[r.chunk_id] = r
+
+    if not id_to_result:
+        return
+
+    for result in scored:
+        if result.metadata.get("fts_table") != "facts":
+            continue
+        fact_id = result.chunk_id
+        try:
+            links = memory_db.get_fact_links(fact_id)
+        except Exception:
+            links = []
+        if not links:
+            continue
+
+        linked_ids: List[str] = []
+        for link in links:
+            other_id = link.get("fact_id_b") if link.get("fact_id_a") == fact_id else link.get("fact_id_a")
+            if other_id and other_id in id_to_result:
+                # Boost the other fact's score
+                other = id_to_result[other_id]
+                other.score += _FACT_LINKS_BOOST
+                linked_ids.append(other_id)
+
+        if linked_ids:
+            result.metadata["linked_fact_ids"] = linked_ids
 hybrid_search = search
 
 

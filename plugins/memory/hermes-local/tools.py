@@ -215,7 +215,7 @@ def _format_hybrid_hit(hit: Any) -> dict:
     """
     if not isinstance(hit, dict):
         return {"content": str(hit)}
-    return {
+    result = {
         "content":     hit.get("text") or hit.get("content") or hit.get("fact_text") or "",
         "source":      hit.get("source") or hit.get("source_ref") or hit.get("source_refs_json"),
         "score":       hit.get("score") or hit.get("rank"),
@@ -224,6 +224,10 @@ def _format_hybrid_hit(hit: Any) -> dict:
         "project":     hit.get("project"),
         "entity":      hit.get("entity"),
     }
+    # MEM-016: surface fact_links adjacency when present
+    if hit.get("linked_fact_ids"):
+        result["linked_fact_ids"] = hit["linked_fact_ids"]
+    return result
 
 
 def _format_decision(row: dict) -> dict:

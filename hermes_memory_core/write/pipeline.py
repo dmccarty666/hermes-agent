@@ -54,6 +54,17 @@ def _llm_complete(
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
+    prompt_len = len(prompt)
+    logger.debug(
+        "dream_llm request: model=%s prompt_chars=%d json_mode=%s",
+        DREAM_LLM_MODEL,
+        prompt_len,
+        json_mode,
+        extra={"dream_llm": True},
+    )
+
+    import requests
+
     payload: Dict[str, Any] = {
         "model": DREAM_LLM_MODEL,
         "messages": messages,
@@ -63,18 +74,38 @@ def _llm_complete(
     if json_mode:
         payload["extra_body"] = {"json_mode": True}
 
-    response = requests.post(
-        f"{DREAM_LLM_URL}/chat/completions",
-        json=payload,
-        headers={"Content-Type": "application/json"},
-        timeout=120.0,
-    )
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"LLM returned {response.status_code}: {response.text[:300]}"
+    try:
+        response = requests.post(
+            f"{DREAM_LLM_URL}/chat/completions",
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=120.0,
         )
-    data = response.json()
-    return data["choices"][0]["message"]["content"]
+        if response.status_code != 200:
+            error_msg = f"LLM returned {response.status_code}: {response.text[:300]}"
+            logger.debug(
+                "dream_llm failure: type=HTTP_%s msg=%s",
+                response.status_code,
+                error_msg[:200],
+                extra={"dream_llm": True},
+            )
+            raise RuntimeError(error_msg)
+        data = response.json()
+        content = data["choices"][0]["message"]["content"]
+        logger.debug(
+            "dream_llm success: response_preview=%s",
+            content[:200],
+            extra={"dream_llm": True},
+        )
+        return content
+    except Exception as exc:
+        logger.debug(
+            "dream_llm failure: type=%s msg=%s",
+            type(exc).__name__,
+            str(exc)[:200],
+            extra={"dream_llm": True},
+        )
+        raise
 
 
 # ── Prompt loading ─────────────────────────────────────────────────────────────

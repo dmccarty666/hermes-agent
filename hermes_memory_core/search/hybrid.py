@@ -533,14 +533,24 @@ def _dedup_results(
 # Trust score helper
 # ---------------------------------------------------------------------------#
 
-def _fetch_trust(memory_db: Any, chunk_id: str) -> float:
-    """Look up trust_score from chunks table. Falls back to 1.0."""
+def _fetch_trust(memory_db: Any, chunk_id: str, fts_table: str = "chunks") -> float:
+    """Look up trust_score from chunks or fact_feedback tables. Falls back to 1.0.
+
+    For "facts" rows, chunk_id is actually the fact_id — look up via fact_feedback.
+    For "chunks"/"decisions" rows, look up from chunks table.
+    """
     try:
         conn = memory_db._connect()
-        row = conn.execute(
-            "SELECT trust_score FROM chunks WHERE chunk_id = ?",
-            (chunk_id,),
-        ).fetchone()
+        if fts_table == "facts":
+            row = conn.execute(
+                "SELECT ff.trust_score FROM fact_feedback ff JOIN facts f ON ff.fact_id = f.fact_id WHERE f.fact_id = ?",
+                (chunk_id,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT trust_score FROM chunks WHERE chunk_id = ?",
+                (chunk_id,),
+            ).fetchone()
         conn.close()
         if row and row[0] is not None:
             return float(row[0])
@@ -612,7 +622,9 @@ def search(
         result.jaccard_score = jaccard_similarity(query, result.content)
         result.hrr_score = hrr_score
         if memory_db is not None:
-            result.trust_score = _fetch_trust(memory_db, result.chunk_id)
+            result.trust_score = _fetch_trust(
+                memory_db, result.chunk_id, fts_table=result.metadata.get("fts_table", "chunks")
+            )
         result.freshness_decay = freshness_decay(
             result.metadata.get("timestamp") or result.metadata.get("date")
         )

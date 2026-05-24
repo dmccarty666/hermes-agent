@@ -29,6 +29,7 @@ import importlib
 import logging
 import os
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -451,12 +452,49 @@ class HermesLocalProvider(MemoryProvider):
     # ── Optional hook: on_session_end ──────────────────────────────────────
 
     def on_session_end(self, messages) -> None:
-        """Called when a session ends. Phase 1 (Epic 1.3.3): handled via sync_turn pipeline."""
+        """Called when a session ends. Phase 1 (Epic 1.3.3): handled via sync_turn pipeline.
+
+        MEM-015: When the session has 3 or more turns, generate a 2-sentence synopsis
+        via a lightweight LLM call and store it in the sessions.summary column.
+        Runs asynchronously in a background thread so it does not block session close.
+        """
         try:
             n = len(messages) if messages is not None else 0
         except TypeError:
             n = 0
         logger.debug("[hermes-local] on_session_end: %s (%d turns)", self._session_id, n)
+
+        if n < 3 or not self._session_id:
+            return
+
+        # Build the turns text for the synopsis prompt
+        try:
+            turns_text = self._build_turns_text(messages)
+        except Exception as e:
+            logger.debug("[hermes-local] on_session_end: failed to build turns text: %s", e)
+            return
+
+        sid = self._session_id
+        t = threading.Thread(
+            target=_generate_session_synopsis,
+            args=(sid, turns_text),
+            daemon=True,
+        )
+        t.start()
+
+    def _build_turns_text(self, messages) -> str:
+        """Flatten messages list into a user/assistant turns string."""
+        lines = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role", "")).strip().lower()
+            content = msg.get("content") or ""
+            if role == "user":
+                lines.append(f"User: {content[:500]}")
+            elif role == "assistant":
+                lines.append(f"Assistant: {content[:500]}")
+        return "\n".join(lines)
 
     # ── Optional hook: on_session_switch (narrative thread) ────────────────
 
@@ -667,3 +705,71 @@ def _utc_iso() -> str:
 def _content_hash(text: str) -> str:
     import hashlib
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+# --------------------------------------------------------------------------
+# Session synopsis generation (MEM-015)
+# --------------------------------------------------------------------------
+
+# Lightweight LLM for session synopsis — uses the same Spark2 GPU node as the dreamer.
+_DREAM_LLM_URL = "http://192.168.2.105:1234"
+_DREAM_LLM_MODEL = "qwen3.6-35b"
+_DREAM_TIMEOUT = 60.0  # seconds
+
+
+def _generate_session_synopsis(session_id: str, turns_text: str) -> None:
+    """Generate a 2-sentence session synopsis via LLM and store in sessions table.
+
+    Called in a background daemon thread from on_session_end so it never blocks
+    session close. Errors are swallowed silently — synopsis failure is non-fatal.
+    """
+    prompt = (
+        "Given the following conversation turns, write a 2-sentence summary of "
+        "what was worked on and what key decision was made. Only output the summary "
+        "text — no preamble or markdown.\n\n"
+        f"Turns:\n{turns_text[:3000]}"
+    )
+
+    try:
+        import json
+        import requests
+
+        messages = [{"role": "user", "content": prompt}]
+        payload = {
+            "model": _DREAM_LLM_MODEL,
+            "messages": messages,
+            "temperature": 0.3,
+            "max_tokens": 128,
+        }
+        response = requests.post(
+            f"{_DREAM_LLM_URL}/chat/completions",
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=_DREAM_TIMEOUT,
+        )
+        if response.status_code != 200:
+            logger.warning(
+                "[hermes-local] synopsis LLM returned %s: %s",
+                response.status_code,
+                response.text[:200],
+            )
+            return
+        data = response.json()
+        synopsis = (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+        if not synopsis:
+            return
+    except Exception as e:
+        logger.debug("[hermes-local] synopsis LLM call failed: %s", e)
+        return
+
+    # Store the synopsis in the sessions table
+    try:
+        from hermes_memory_core.store.sqlite import get_memory_store
+        store = get_memory_store()
+        store.upsert_session({
+            "session_id": session_id,
+            "summary": synopsis,
+        })
+        logger.info("[hermes-local] Session synopsis saved for %s", session_id)
+    except Exception as e:
+        logger.debug("[hermes-local] failed to save synopsis for %s: %s", session_id, e)

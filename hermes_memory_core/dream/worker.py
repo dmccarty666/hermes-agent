@@ -48,6 +48,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_memory_core.store.sqlite import get_memory_store
 from hermes_memory_core.write.pipeline import write_memory
+from hermes_memory_core.metrics import MetricsWriter
 from hermes_memory_core.dream.contradict import find_conflicts, mark_disputed, Conflict
 from hermes_memory_core.dream.rel_extract import RelationExtractor
 
@@ -517,6 +518,7 @@ class DreamWorker:
                 output_path="",
                 errors=self._errors,
             )
+            MetricsWriter().update()
 
         return self._run_result()
 
@@ -886,6 +888,7 @@ class DreamWorker:
             contradictions_detected=run.contradictions_detected,
             errors=None,
         )
+        MetricsWriter().update()
 
     def _mark_turns_dreamed(self, turn_ids: List[str]) -> None:
         """Mark turns as dreamed."""
@@ -1589,6 +1592,7 @@ class DreamWorker:
             contradictions_detected=self._contradictions_detected,
             errors=self._errors if self._errors else None,
         )
+        MetricsWriter().update()
 
     def _write_dream_report(self, turns: List[Dict[str, Any]]) -> str:
         """Write the dream run report to ~/.hermes/memory/dreams/YYYY-MM-DD-HHMM.md."""
@@ -1734,6 +1738,7 @@ class DreamWorker:
             contradictions_detected=self._contradictions_detected,
             errors=self._errors if self._errors else None,
         )
+        MetricsWriter().update()
 
     def _run_result(self) -> Dict[str, Any]:
         return {

@@ -52,7 +52,7 @@ from gateway.status import get_running_pid, read_runtime_status
 try:
     from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel
 except ImportError:
@@ -64,7 +64,7 @@ except ImportError:
         _lazy_ensure("tool.dashboard", prompt=False)
         from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
         from fastapi.middleware.cors import CORSMiddleware
-        from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+        from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
         from fastapi.staticfiles import StaticFiles
         from pydantic import BaseModel
     except Exception:
@@ -4464,6 +4464,64 @@ async def serve_plugin_asset(plugin_name: str, file_path: str):
     )
 
 
+@app.get("/memory-docs/{file_path:path}")
+async def serve_memory_docs(file_path: str):
+    """Serve the hermes-local memory documentation HTML pages.
+
+    Pages live in HERMES_HOME/memory/docs/ and are also copied to the web_dist
+    bundle so they are available in every profile without path dependency.
+    """
+    # Empty file_path (trailing slash access like /memory-docs/) → serve index
+    if not file_path:
+        file_path = "index.html"
+
+    # Try HERMES_HOME/memory/docs/ first (authoritative source)
+    hermes_home = get_hermes_home()
+    memory_docs_home = hermes_home / "memory" / "docs"
+
+    candidates: list[Path] = []
+    for base in (memory_docs_home, WEB_DIST / "memory-docs"):
+        target = (base / file_path).resolve()
+        # Path traversal guard
+        if target.resolve().is_relative_to(base.resolve()) and target.exists() and target.is_file():
+            candidates.append(target)
+
+    if not candidates:
+        raise HTTPException(status_code=404, detail="Documentation page not found")
+
+    # Prefer the hermes-home version when it exists (always current)
+    target = candidates[0]
+
+    suffix = target.suffix.lower()
+    content_types = {
+        ".html": "text/html; charset=utf-8",
+        ".css": "text/css",
+        ".js": "application/javascript",
+        ".json": "application/json",
+        ".svg": "image/svg+xml",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".ico": "image/x-icon",
+    }
+    media_type = content_types.get(suffix, "application/octet-stream")
+
+    return FileResponse(
+        str(target),
+        media_type=media_type,
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
+
+
+@app.get("/memory-docs")
+async def redirect_memory_docs(request: Request):
+    """Redirect /memory-docs → /memory-docs/index.html.
+    We cannot redirect to /memory-docs/ (trailing slash) because the greedy
+    {file_path:path} route captures an empty string for file_path, making
+    the handler unable to locate a file and raising 404.
+    """
+    return RedirectResponse(url="/memory-docs/index.html", status_code=301)
+
+
 # ---------------------------------------------------------------------------
 # Memory dashboard endpoints (M1) — see docs/design/memory-dashboard/API.md
 #
@@ -4889,6 +4947,34 @@ async def post_memory_backend_ping(request: Request, name: str):
         # Probe ran but backend is down — surface 503 with body per spec §6.
         return JSONResponse(status_code=503, content=block)
     return block
+
+
+# ── G3.2: Entity timeline via evolved_from/renamed_to edges ──────────────────
+
+
+@app.get("/api/memory/graph/timeline")
+async def get_graph_timeline(request: Request, entity: str):
+    """
+    Full timeline for an entity via evolved_from/renamed_to edges.
+
+    Returns predecessors (older entities) and successors (newer entities)
+    as an ordered timeline list.
+    """
+    _require_token(request)
+    try:
+        from hermes_memory_core.store.sqlite import MemoryStore
+        from hermes_memory_core.dream.temporal import get_entity_timeline
+
+        memory_dir, sqlite_path, _ = _memory_paths()
+        store = MemoryStore(sqlite_path)
+        timeline = get_entity_timeline(store, entity)
+        store.close()
+        return timeline
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={"detail": str(exc), "entity": entity, "code": "TIMELINE_FAILED"},
+        ) from exc
 
 
 def _mount_plugin_api_routes():

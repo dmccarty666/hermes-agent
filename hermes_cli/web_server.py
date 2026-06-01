@@ -6015,6 +6015,433 @@ async def serve_plugin_asset(plugin_name: str, file_path: str):
     )
 
 
+# ---------------------------------------------------------------------------
+# Memory dashboard endpoints (M1) — see docs/design/memory-dashboard/API.md
+#
+# Per the wire-format convention used by other /api/dashboard/* routes
+# (plugins, themes, etc.), the memory routes live under /api/dashboard/memory
+# even though the API.md spec uses the shorter /api/memory/... form for
+# readability. The shapes returned here are exactly the shapes in API.md
+# §1-§6.
+# ---------------------------------------------------------------------------
+
+_MEMORY_STATUS_CACHE: Dict[str, Any] = {"value": None, "ts": 0.0}
+_MEMORY_STATUS_TTL_S = 5.0
+_MEMORY_REFRESH_LAST: Dict[str, float] = {}
+_MEMORY_REFRESH_MIN_INTERVAL_S = 5.0
+
+_MEMORY_BACKENDS = ("sqlite", "qdrant", "embedding", "llm", "disk")
+
+
+def _memory_now_iso() -> str:
+    """UTC ISO-8601 timestamp with Z suffix (matches API.md convention)."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _memory_paths() -> Tuple[Path, Path, Path]:
+    """Return (memory_dir, sqlite_path, metrics_json_path) under HERMES_HOME."""
+    memory_dir = get_hermes_home() / "memory"
+    sqlite_path = memory_dir / "index" / "memory.sqlite"
+    metrics_path = memory_dir / "metrics.json"
+    return memory_dir, sqlite_path, metrics_path
+
+
+def _memory_qdrant_client():
+    """Best-effort QdrantClient at localhost:6333. None if package missing."""
+    try:
+        from qdrant_client import QdrantClient
+        return QdrantClient("http://localhost:6333", timeout=3)
+    except Exception:
+        return None
+
+
+def _memory_provider_active() -> Tuple[str, bool, bool]:
+    """Return (provider_name, active, installed).
+
+    'active' means the configured memory provider is 'hermes-local'.
+    'installed' means hermes_memory_core is importable.
+    """
+    try:
+        config = load_config()
+        provider = cfg_get(config, "memory", "provider", default="hermes-local") or "hermes-local"
+    except Exception:
+        provider = "hermes-local"
+    try:
+        import hermes_memory_core  # noqa: F401
+        installed = True
+    except Exception:
+        installed = False
+    active = (provider == "hermes-local")
+    return provider, active, installed
+
+
+def _memory_run_health_check() -> Dict[str, Any]:
+    """Run the rolled-up health check from hermes_memory_core.health."""
+    from hermes_memory_core import health as _health
+    _, sqlite_path, _ = _memory_paths()
+    qdrant_client = _memory_qdrant_client()
+    rolled = _health.health_check(
+        db_path=sqlite_path,
+        qdrant_client=qdrant_client,
+    )
+    return dict(rolled)
+
+
+def _memory_status_payload(force: bool = False) -> Dict[str, Any]:
+    """Build the /status payload — cached for _MEMORY_STATUS_TTL_S seconds."""
+    now = time.time()
+    cached = _MEMORY_STATUS_CACHE["value"]
+    cached_ts = _MEMORY_STATUS_CACHE["ts"]
+    if not force and cached is not None and (now - cached_ts) < _MEMORY_STATUS_TTL_S:
+        out = dict(cached)
+        out["cached"] = True
+        return out
+
+    provider, active, installed = _memory_provider_active()
+
+    if not active or not installed:
+        payload = {
+            "provider": provider,
+            "active": active,
+            "installed": installed,
+            "overall": "inactive" if not active else "error",
+            "components": None,
+            "checked_at": _memory_now_iso(),
+            "cached": False,
+            "cache_ttl": int(_MEMORY_STATUS_TTL_S),
+        }
+        _MEMORY_STATUS_CACHE["value"] = payload
+        _MEMORY_STATUS_CACHE["ts"] = now
+        return payload
+
+    rolled = _memory_run_health_check()
+    components = {
+        "sqlite":    {"status": rolled.get("sqlite", {}).get("status", "error"),
+                      "message": rolled.get("sqlite", {}).get("message")},
+        "qdrant":    {"status": rolled.get("qdrant", {}).get("status", "error"),
+                      "message": rolled.get("qdrant", {}).get("message")},
+        "embedding": {"status": rolled.get("embedding", {}).get("status", "error"),
+                      "message": rolled.get("embedding", {}).get("message")},
+        "llm":       {"status": rolled.get("llm", {}).get("status", "error"),
+                      "message": rolled.get("llm", {}).get("message")},
+        "disk":      {"status": rolled.get("disk", {}).get("status", "error"),
+                      "message": rolled.get("disk", {}).get("message")},
+    }
+
+    payload = {
+        "provider": provider,
+        "active": True,
+        "installed": True,
+        "overall": rolled.get("overall", "error"),
+        "components": components,
+        "checked_at": _memory_now_iso(),
+        "cached": False,
+        "cache_ttl": int(_MEMORY_STATUS_TTL_S),
+    }
+    _MEMORY_STATUS_CACHE["value"] = payload
+    _MEMORY_STATUS_CACHE["ts"] = now
+    return payload
+
+
+def _memory_backend_block(name: str) -> Dict[str, Any]:
+    """Return the per-backend block in the API.md §2 shape for one backend.
+
+    Raises KeyError if name is not a known backend.
+    """
+    from hermes_memory_core import health as _health
+    if name not in _MEMORY_BACKENDS:
+        raise KeyError(name)
+
+    _, sqlite_path, _ = _memory_paths()
+
+    if name == "sqlite":
+        r = _health.check_sqlite(sqlite_path)
+        return {
+            "status": r.get("status", "error"),
+            "path": r.get("path", str(sqlite_path)),
+            "journal_mode": r.get("journal_mode", "unknown"),
+            "size_bytes": r.get("size_bytes", 0),
+            "last_success_at": _memory_now_iso() if r.get("status") == "ok" else None,
+            "message": r.get("message"),
+        }
+    if name == "qdrant":
+        client = _memory_qdrant_client()
+        if client is None:
+            return {
+                "status": "error",
+                "endpoint": "http://localhost:6333",
+                "collections_count": 0,
+                "collections": [],
+                "points_count": 0,
+                "last_success_at": None,
+                "message": "qdrant_client package not installed",
+            }
+        r = _health.check_qdrant(client)
+        points_count = 0
+        if r.get("status") == "ok":
+            try:
+                for cname in r.get("collections", []) or []:
+                    try:
+                        info = client.get_collection(cname)
+                        points_count += int(info.points_count or 0)
+                    except Exception:
+                        pass
+            except Exception:
+                points_count = 0
+        return {
+            "status": r.get("status", "error"),
+            "endpoint": "http://localhost:6333",
+            "collections_count": r.get("collections_count", 0),
+            "collections": r.get("collections", []),
+            "points_count": points_count,
+            "last_success_at": _memory_now_iso() if r.get("status") == "ok" else None,
+            "message": r.get("message"),
+        }
+    if name == "embedding":
+        r = _health.check_embedding(_health.DEFAULT_EMBEDDING_ENDPOINT)
+        return {
+            "status": r.get("status", "error"),
+            "endpoint": r.get("endpoint", _health.DEFAULT_EMBEDDING_ENDPOINT),
+            "model": r.get("model", "unknown"),
+            "dim": None,
+            "last_success_at": _memory_now_iso() if r.get("status") == "ok" else None,
+            "message": r.get("message"),
+        }
+    if name == "llm":
+        r = _health.check_llm(_health.DEFAULT_LLM_ENDPOINT)
+        return {
+            "status": r.get("status", "error"),
+            "endpoint": r.get("endpoint", _health.DEFAULT_LLM_ENDPOINT),
+            "model": r.get("model", "unknown"),
+            "last_latency_ms": None,
+            "last_success_at": _memory_now_iso() if r.get("status") == "ok" else None,
+            "message": r.get("message"),
+        }
+    if name == "disk":
+        _, sqlite_path2, _ = _memory_paths()
+        r = _health.check_disk(sqlite_path2.parent.parent if sqlite_path2 else get_hermes_home())
+        return {
+            "status": r.get("status", "error"),
+            "path": r.get("path", str(get_hermes_home())),
+            "free_bytes": r.get("free_bytes", 0),
+            "free_gb": r.get("free_gb", 0.0),
+            "message": r.get("message"),
+        }
+    raise KeyError(name)  # unreachable
+
+
+def _memory_read_metrics_json() -> Optional[Dict[str, Any]]:
+    """Read ~/.hermes/memory/metrics.json or return None if absent/invalid."""
+    _, _, metrics_path = _memory_paths()
+    if not metrics_path.exists():
+        return None
+    try:
+        return json.loads(metrics_path.read_text())
+    except Exception as exc:
+        _log.warning("memory metrics.json invalid: %s", exc)
+        return None
+
+
+def _memory_metrics_writer():
+    """Construct a MetricsWriter pinned to HERMES_HOME."""
+    from hermes_memory_core.metrics import MetricsWriter
+    memory_dir, sqlite_path, _ = _memory_paths()
+    return MetricsWriter(memory_dir=memory_dir, db_path=sqlite_path)
+
+
+def _memory_metrics_with_envelope(
+    raw: Dict[str, Any],
+    *,
+    include_stale: bool = True,
+) -> Dict[str, Any]:
+    """Wrap a metrics dict with the /counters response envelope."""
+    _, _, metrics_path = _memory_paths()
+    stale_seconds: Optional[int] = None
+    if include_stale and metrics_path.exists():
+        try:
+            mtime = metrics_path.stat().st_mtime
+            stale_seconds = max(0, int(time.time() - mtime))
+        except Exception:
+            stale_seconds = None
+
+    out = dict(raw)
+    out["metrics_file"] = str(metrics_path)
+    out["stale_seconds"] = stale_seconds
+    # deltas_24h not implemented yet (requires snapshot store) — null per spec
+    out.setdefault("deltas_24h", None)
+    return out
+
+
+@app.get("/api/dashboard/memory/status")
+async def get_memory_status(request: Request):
+    """Cheap rolled-up health for the Tier 1 banner. API.md §1."""
+    _require_token(request)
+    try:
+        return _memory_status_payload()
+    except Exception as exc:
+        _log.warning("memory/status failed: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail={"detail": str(exc), "code": "STATUS_FAILED"},
+        ) from exc
+
+
+@app.get("/api/dashboard/memory/backends")
+async def get_memory_backends(request: Request, refresh: bool = False):
+    """Detailed per-backend report for Tier 3. API.md §2."""
+    _require_token(request)
+    if refresh:
+        _MEMORY_STATUS_CACHE["value"] = None
+        _MEMORY_STATUS_CACHE["ts"] = 0.0
+    try:
+        payload: Dict[str, Any] = {}
+        for name in _MEMORY_BACKENDS:
+            payload[name] = _memory_backend_block(name)
+        payload["checked_at"] = _memory_now_iso()
+        return payload
+    except Exception as exc:
+        _log.warning("memory/backends failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail={"detail": str(exc), "code": "BACKENDS_FAILED"},
+        ) from exc
+
+
+@app.get("/api/dashboard/memory/counters")
+async def get_memory_counters(request: Request, force: bool = False):
+    """Tier 2 counter strip. API.md §3."""
+    _require_token(request)
+    raw: Optional[Dict[str, Any]] = None
+    if force:
+        try:
+            raw = _memory_metrics_writer().update()
+        except Exception as exc:
+            _log.warning("memory/counters force refresh failed: %s", exc)
+            raw = None
+    if raw is None:
+        raw = _memory_read_metrics_json()
+    if raw is None:
+        # try a one-shot refresh before giving up
+        try:
+            raw = _memory_metrics_writer().update()
+        except Exception as exc:
+            _log.warning("memory/counters synchronous refresh failed: %s", exc)
+            raw = None
+    if raw is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "detail": "metrics not yet available — initialize the memory tree",
+                "code": "METRICS_MISSING",
+            },
+        )
+    return _memory_metrics_with_envelope(raw)
+
+
+@app.get("/api/dashboard/memory/metrics-json")
+async def get_memory_metrics_json(request: Request, force: bool = False):
+    """Raw pass-through of metrics.json. API.md §4."""
+    _require_token(request)
+    if force:
+        try:
+            return _memory_metrics_writer().update()
+        except Exception as exc:
+            _log.warning("memory/metrics-json force refresh failed: %s", exc)
+            raise HTTPException(
+                status_code=500,
+                detail={"detail": str(exc), "code": "REFRESH_FAILED"},
+            ) from exc
+    raw = _memory_read_metrics_json()
+    if raw is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"detail": "metrics.json not found", "code": "METRICS_MISSING"},
+        )
+    return raw
+
+
+@app.post("/api/dashboard/memory/metrics/refresh")
+async def post_memory_metrics_refresh(request: Request):
+    """Force MetricsWriter().update() and return the freshly-written metrics.
+
+    API.md §5. Rate-limited to 1/5s per session token (best-effort).
+    """
+    _require_token(request)
+
+    # Rate-limit per-token (best-effort, in-process)
+    token = (
+        request.headers.get(_SESSION_HEADER_NAME, "")
+        or request.headers.get("authorization", "")
+    )
+    now = time.time()
+    last = _MEMORY_REFRESH_LAST.get(token, 0.0)
+    if (now - last) < _MEMORY_REFRESH_MIN_INTERVAL_S:
+        retry_after = int(_MEMORY_REFRESH_MIN_INTERVAL_S - (now - last)) + 1
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "detail": "metrics refresh rate-limited (1/5s per session)",
+                "code": "RATE_LIMITED",
+                "retry_after_s": retry_after,
+            },
+        )
+    _MEMORY_REFRESH_LAST[token] = now
+
+    try:
+        raw = _memory_metrics_writer().update()
+    except Exception as exc:
+        _log.warning("memory/metrics/refresh failed: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail={"detail": str(exc), "code": "REFRESH_FAILED"},
+        ) from exc
+    # Same shape as /counters but without deltas_24h (spec §5)
+    out = dict(raw)
+    _, _, metrics_path = _memory_paths()
+    out["metrics_file"] = str(metrics_path)
+    try:
+        out["stale_seconds"] = 0
+    except Exception:
+        out["stale_seconds"] = None
+    return out
+
+
+@app.post("/api/dashboard/memory/backends/{name}/ping")
+async def post_memory_backend_ping(request: Request, name: str):
+    """Re-probe one backend in isolation. API.md §6."""
+    _require_token(request)
+    if name not in _MEMORY_BACKENDS:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "detail": f"unknown backend: {name}",
+                "code": "BACKEND_UNKNOWN",
+                "backend": name,
+            },
+        )
+    # Bust the status cache so a subsequent /status call reflects the probe.
+    _MEMORY_STATUS_CACHE["value"] = None
+    _MEMORY_STATUS_CACHE["ts"] = 0.0
+    try:
+        block = _memory_backend_block(name)
+    except Exception as exc:
+        _log.warning("memory/backends/%s/ping failed: %s", name, exc)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "detail": str(exc),
+                "code": "BACKEND_DOWN",
+                "backend": name,
+            },
+        ) from exc
+
+    if block.get("status") == "error":
+        # Probe ran but backend is down — surface 503 with body per spec §6.
+        return JSONResponse(status_code=503, content=block)
+    return block
+
+
 def _mount_plugin_api_routes():
     """Import and mount backend API routes from plugins that declare them.
 

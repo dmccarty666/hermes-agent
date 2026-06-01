@@ -504,6 +504,31 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name }),
     }),
+
+  // Memory dashboard (M1).
+  // NOTE: SPEC.md / API.md document these routes as `/api/memory/...` for
+  // readability. The actual wire format is `/api/dashboard/memory/...` —
+  getMemoryStatus: () =>
+    fetchJSON<MemoryStatusResponse>("/api/dashboard/memory/status"),
+  getMemoryBackends: (refresh = false) =>
+    fetchJSON<MemoryBackendsResponse>(
+      `/api/dashboard/memory/backends${refresh ? "?refresh=true" : ""}`,
+    ),
+  getMemoryCounters: (force = false) =>
+    fetchJSON<MemoryCountersResponse>(
+      `/api/dashboard/memory/counters${force ? "?force=true" : ""}`,
+    ),
+  getMemoryMetricsJson: () =>
+    fetchJSON<Record<string, unknown>>("/api/dashboard/memory/metrics-json"),
+  postMemoryRefresh: () =>
+    fetchJSON<MemoryCountersResponse>("/api/dashboard/memory/metrics/refresh", {
+      method: "POST",
+    }),
+  postMemoryBackendPing: (name: MemoryBackendName) =>
+    fetchJSON<MemoryBackendInfo>(
+      `/api/dashboard/memory/backends/${encodeURIComponent(name)}/ping`,
+      { method: "POST" },
+    ),
 };
 
 /** Identity payload returned by ``GET /api/auth/me`` (Phase 7).
@@ -1014,4 +1039,70 @@ export interface AgentPluginUpdateResponse {
 export interface PluginProvidersPutRequest {
   memory_provider?: string;
   context_engine?: string;
+}
+
+// Memory dashboard types (M1)
+export type MemoryHealthStatus = "ok" | "degraded" | "error" | "inactive";
+export type MemoryComponentStatus = "ok" | "degraded" | "error";
+export type MemoryBackendName =
+  | "sqlite"
+  | "qdrant"
+  | "embedding"
+  | "llm"
+  | "disk";
+
+export interface MemoryComponentInfo {
+  status: MemoryComponentStatus;
+  message?: string;
+}
+
+export interface MemoryStatusResponse {
+  provider: string;
+  active: boolean;
+  overall: MemoryHealthStatus;
+  components: Record<string, MemoryComponentInfo> | null;
+}
+
+export interface MemoryBackendInfo {
+  status: MemoryComponentStatus;
+  message?: string;
+  // SQLite
+  path?: string;
+  journal_mode?: string;
+  size_bytes?: number;
+  // Qdrant
+  endpoint?: string;
+  collections_count?: number;
+  points_count?: number;
+  // Embedding
+  model?: string;
+  dim?: number;
+  // LLM
+  // Disk
+  free_gb?: number;
+  // All
+  last_latency_ms?: number;
+  last_success_at?: string;
+}
+
+export interface MemoryBackendsResponse {
+  sqlite?: MemoryBackendInfo;
+  qdrant?: MemoryBackendInfo;
+  embedding?: MemoryBackendInfo;
+  llm?: MemoryBackendInfo;
+  disk?: MemoryBackendInfo;
+}
+
+export interface MemoryCountersResponse {
+  facts_active: number;
+  captured_turns_24h: number;
+  chunks_indexed_24h: number;
+  chunks_pending: number;
+  qdrant_points: number;
+  deltas_24h?: {
+    facts_active?: number;
+    qdrant_points?: number;
+  };
+  last_dream_run_at?: string;
+  last_dream_status?: string;
 }

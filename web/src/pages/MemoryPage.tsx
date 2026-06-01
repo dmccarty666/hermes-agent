@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, useRef } from "react";
 import {
   Brain,
   Database,
@@ -6,6 +6,8 @@ import {
   Network,
   RefreshCw,
   Sparkles,
+  BarChart3,
+  GitBranch,
 } from "lucide-react";
 import { api } from "@/lib/api";
 import type {
@@ -14,9 +16,12 @@ import type {
   MemoryBackendsResponse,
   MemoryComponentStatus,
   MemoryCountersResponse,
+  MemoryGraphFullResponse,
+  MemoryGraphStatsResponse,
   MemoryHealthStatus,
   MemoryStatusResponse,
 } from "@/lib/api";
+import ForceGraph2D from "react-force-graph-2d";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Badge } from "@nous-research/ui/ui/components/badge";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
@@ -124,6 +129,8 @@ export default function MemoryPage() {
   const [status, setStatus] = useState<MemoryStatusResponse | null>(null);
   const [backends, setBackends] = useState<MemoryBackendsResponse | null>(null);
   const [counters, setCounters] = useState<MemoryCountersResponse | null>(null);
+  const [graphStats, setGraphStats] = useState<MemoryGraphStatsResponse | null>(null);
+  const [graphFull, setGraphFull] = useState<MemoryGraphFullResponse | null>(null);
 
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [lastError, setLastError] = useState<string | null>(null);
@@ -141,17 +148,21 @@ export default function MemoryPage() {
       const isFirst = loadState === "idle";
       if (isFirst) setLoadState("loading");
 
-      const [statusR, backendsR, countersR] = await Promise.allSettled([
+      const [statusR, backendsR, countersR, graphR, graphFullR] = await Promise.allSettled([
         api.getMemoryStatus(),
         api.getMemoryBackends(),
         api.getMemoryCounters(),
+        api.getMemoryGraphStats(),
+        api.getMemoryGraphFull(),
       ]);
 
       if (statusR.status === "fulfilled") setStatus(statusR.value);
       if (backendsR.status === "fulfilled") setBackends(backendsR.value);
       if (countersR.status === "fulfilled") setCounters(countersR.value);
+      if (graphR.status === "fulfilled") setGraphStats(graphR.value);
+      if (graphFullR.status === "fulfilled") setGraphFull(graphFullR.value);
 
-      const errs = [statusR, backendsR, countersR].filter(
+      const errs = [statusR, backendsR, countersR, graphR, graphFullR].filter(
         (r): r is PromiseRejectedResult => r.status === "rejected",
       );
 
@@ -264,8 +275,8 @@ export default function MemoryPage() {
           pingBusy={pingBusy}
         />
 
-        {/* Tier 5 placeholder — knowledge graph (M4) */}
-        <KnowledgeGraphPlaceholder />
+        {/* Tier 5 — knowledge graph (M4) */}
+        <KnowledgeGraph graphStats={graphStats} graphFull={graphFull} loadState={loadState} />
       </div>
 
       <Toast toast={toast} />
@@ -604,25 +615,212 @@ function BackendCard({
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Tier 5 placeholder — Knowledge graph (M4)
+// Tier 5 — Knowledge graph (M4)
 // ───────────────────────────────────────────────────────────────────────────
 
-function KnowledgeGraphPlaceholder() {
+type GraphView = "stats" | "graph";
+
+function KnowledgeGraph({
+  graphStats,
+  graphFull,
+  loadState,
+}: {
+  graphStats: MemoryGraphStatsResponse | null;
+  graphFull: MemoryGraphFullResponse | null;
+  loadState: LoadState;
+}) {
+  const [view, setView] = useState<GraphView>("stats");
+  const graphRef = useRef<any>(null);
+  const isLoading = loadState === "loading" && !graphStats && !graphFull;
+
+  // Center the graph when switching to graph view
+  const showGraph = useCallback(() => {
+    setView("graph");
+    // Give the DOM a tick to render, then center
+    setTimeout(() => {
+      graphRef.current?.d3Force("charge")?.strength(-120);
+      graphRef.current?.zoomToFit(400, 50);
+    }, 80);
+  }, []);
+
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Knowledge graph</CardTitle>
-        <p className="text-[0.7rem] tracking-[0.08em] text-midground/55 normal-case">
-          Coming in M4
-        </p>
+        <div className="flex items-center justify-between">
+          <CardTitle className="flex items-center gap-2">
+            <Network className="h-4 w-4" />
+            Knowledge graph
+          </CardTitle>
+          {/* View toggle */}
+          <div className="flex items-center gap-1 rounded-md border border-border/50 p-0.5">
+            <button
+              onClick={() => setView("stats")}
+              className={`flex items-center gap-1.5 rounded px-2.5 py-1 text-[0.7rem] transition-colors ${
+                view === "stats"
+                  ? "bg-primary text-primary-foreground"
+                  : "text-midforeground/55 hover:text-midforeground"
+              }`}
+            >
+              <BarChart3 className="h-3 w-3" />
+              Stats
+            </button>
+            <button
+              onClick={showGraph}
+              className={`flex items-center gap-1.5 rounded px-2.5 py-1 text-[0.7rem] transition-colors ${
+                view === "graph"
+                  ? "bg-primary text-primary-foreground"
+                  : "text-midforeground/55 hover:text-midforeground"
+              }`}
+            >
+              <GitBranch className="h-3 w-3" />
+              Graph
+              {graphFull && (
+                <span className="text-[0.6rem] opacity-70">
+                  ({graphFull.nodes.length})
+                </span>
+              )}
+            </button>
+          </div>
+        </div>
       </CardHeader>
-      <CardContent>
-        <p className="text-[0.7rem] text-midforeground/55 normal-case">
-          Top entities, contradictions, and low-trust facts will surface here
-          once the dreamer schema lands. The data already exists in SQLite —
-          the M4 milestone wires the read endpoints and the visualization.
-        </p>
+      <CardContent className="flex flex-col gap-4">
+        {isLoading && (
+          <div className="flex h-48 items-center justify-center">
+            <Spinner />
+          </div>
+        )}
+
+        {view === "stats" && !isLoading && graphStats && (
+          <>
+            {/* Stats grid */}
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+              <StatPill label="Facts" value={graphStats.facts.total} icon={Brain} />
+              <StatPill label="Active" value={graphStats.facts.active} icon={Sparkles} />
+              <StatPill label="Relations" value={graphStats.entity_relations.total} icon={Network} />
+              <StatPill label="Links" value={graphStats.fact_links.total} icon={Database} />
+            </div>
+
+            {/* Top entities */}
+            {graphStats.top_entities.length > 0 && (
+              <div>
+                <p className="mb-2 text-[0.7rem] tracking-[0.08em] text-midground/55 uppercase">
+                  Top entities
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  {graphStats.top_entities.slice(0, 12).map(({ entity, fact_count }) => (
+                    <Badge key={entity} tone="outline" className="text-[0.7rem]">
+                      {entity} <span className="text-midforeground/45">({fact_count})</span>
+                    </Badge>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Fact→entity mapping count */}
+            <div className="flex items-center justify-between border-t border-border/50 pt-3 text-[0.7rem] text-midforeground/55">
+              <span>Entity-fact mappings</span>
+              <span>{graphStats.fact_entities.total.toLocaleString()}</span>
+            </div>
+          </>
+        )}
+
+        {view === "graph" && (
+          <div className="flex flex-col gap-2">
+            {isLoading ? (
+              <div className="flex h-64 items-center justify-center">
+                <Spinner />
+              </div>
+            ) : graphFull && graphFull.nodes.length > 0 ? (
+              <>
+                <div className="flex items-center gap-3 text-[0.65rem] text-midforeground/55">
+                  <span>{graphFull.nodes.length} nodes · {graphFull.links.length} edges</span>
+                  <span className="text-midforeground/30">·</span>
+                  <span>drag to move · scroll to zoom · hover for label</span>
+                </div>
+                <div
+                  className="overflow-hidden rounded-md border border-border/40"
+                  style={{ height: 480 }}
+                >
+                  <ForceGraph2D
+                    ref={graphRef}
+                    graphData={graphFull}
+                    nodeId="id"
+                    nodeVal="val"
+                    nodeColor={(n: any) => n.color ?? "#64748b"}
+                    nodeCanvasObjectMode={() => 'replace'}
+                    nodeCanvasObject={(node: any, ctx: any, globalScale: number) => {
+                      const r = Math.max(4, Math.sqrt(node.val || 1) * 1.5);
+                      const fontSize = Math.max(7, 9 / globalScale);
+                      // Draw node circle
+                      ctx.beginPath();
+                      ctx.arc(node.x ?? 0, node.y ?? 0, r, 0, 2 * Math.PI);
+                      ctx.fillStyle = node.color ?? "#64748b";
+                      ctx.fill();
+                      ctx.strokeStyle = "rgba(255,255,255,0.15)";
+                      ctx.lineWidth = 0.5;
+                      ctx.stroke();
+                      // Draw label below node
+                      const label = String(node.name ?? node.id ?? "");
+                      const maxW = Math.max(r * 5, 50);
+                      const words = label.split(/\s+/);
+                      let line = "", lines: string[] = [];
+                      for (const w of words) {
+                        const test = line ? `${line} ${w}` : w;
+                        if (ctx.measureText(test).width > maxW && line) { lines.push(line); line = w; }
+                        else { line = test; }
+                      }
+                      if (line) lines.push(line);
+                      const lh = fontSize * 1.25;
+                      const startY = (node.y ?? 0) + r + 2;
+                      ctx.font = `500 ${fontSize}px Sans-Serif`;
+                      ctx.textAlign = "center";
+                      ctx.textBaseline = "top";
+                      ctx.fillStyle = "rgba(203,213,225,0.9)";
+                      lines.forEach((l, i) => ctx.fillText(l, node.x ?? 0, startY + i * lh));
+                    }}
+                    linkColor={() => "rgba(148,163,184,0.25)"}
+                    linkWidth={(l: any) => Math.max(0.5, (l.weight ?? 0.8) * 2)}
+                    linkDirectionalArrowLength={4}
+                    linkDirectionalArrowRelPos={0.9}
+                    backgroundColor="transparent"
+                    warmupTicks={60}
+                    cooldownTicks={120}
+                    onNodeClick={(node: any) => {
+                      // Center on click
+                      graphRef.current?.centerAt(node.x, node.y, 500);
+                      graphRef.current?.zoom(3, 500);
+                    }}
+                  />
+                </div>
+              </>
+            ) : (
+              <div className="flex h-32 items-center justify-center text-[0.75rem] text-midforeground/55">
+                No graph data available — run Dreamer to populate entity relations.
+              </div>
+            )}
+          </div>
+        )}
       </CardContent>
     </Card>
+  );
+}
+
+function StatPill({
+  label,
+  value,
+  icon: Icon,
+}: {
+  label: string;
+  value: number;
+  icon: typeof Brain;
+}) {
+  return (
+    <div className="flex items-center gap-2 rounded-md border border-border/50 bg-background/50 px-3 py-2">
+      <Icon className="h-3.5 w-3.5 text-midforeground/55" />
+      <div>
+        <p className="text-[0.65rem] text-midforeground/55">{label}</p>
+        <p className="font-mono text-sm font-semibold">{value.toLocaleString()}</p>
+      </div>
+    </div>
   );
 }

@@ -6515,6 +6515,721 @@ def _mount_plugin_api_routes():
             _log.warning("Failed to load plugin %s API routes: %s", plugin["name"], exc)
 
 
+
+# Memory dashboard — M2 Dreamer  (API.md §7-§12)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/dashboard/memory/dreamer/last")
+async def get_memory_dreamer_last(request: Request):
+    """Most recent dream run. API.md §7."""
+    _require_token(request)
+    _, _, _ = _memory_paths()
+    memory_dir = get_hermes_home() / "memory"
+    db_path = memory_dir / "index" / "memory.sqlite"
+    import sqlite3, json
+    conn = sqlite3.connect(str(db_path))
+    row = conn.execute(
+        "SELECT dream_run_id, started_at, ended_at, status, facts_created, "
+        "decisions_created, questions_created, input_scope_json, output_path, "
+        "errors_json, llm_model, llm_endpoint FROM dream_runs "
+        "ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail={"detail": "no dream runs", "code": "NO_RUNS"})
+    started = row[1]
+    ended = row[2]
+    duration_s = None
+    if started and ended:
+        try:
+            from datetime import datetime
+            s = datetime.fromisoformat(started.replace("+00:00", "Z").replace("Z", "+00:00"))
+            e = datetime.fromisoformat(ended.replace("+00:00", "Z").replace("Z", "+00:00"))
+            duration_s = round((e - s).total_seconds(), 1)
+        except Exception:
+            duration_s = None
+    errors = None
+    if row[9]:
+        try:
+            errors = json.loads(row[9])
+        except Exception:
+            errors = row[9]
+    return {
+        "id": row[0],
+        "started_at": started,
+        "finished_at": ended,
+        "duration_s": duration_s,
+        "status": row[3],
+        "facts_extracted": row[4] or 0,
+        "decisions_extracted": row[5] or 0,
+        "open_questions_extracted": row[6] or 0,
+        "turns_processed": 0,
+        "embed_calls": 0,
+        "llm_tokens_in": 0,
+        "llm_tokens_out": 0,
+        "report_path": row[8] or None,
+        "report_available": bool(row[8]),
+        "error_message": errors if isinstance(errors, str) else None,
+    }
+
+
+@app.get("/api/dashboard/memory/dreamer/runs")
+async def get_memory_dreamer_runs(
+    request: Request,
+    limit: int = 20,
+    offset: int = 0,
+    status: Optional[str] = None,
+):
+    """Paginated list of dream runs. API.md §8."""
+    _require_token(request)
+    memory_dir = get_hermes_home() / "memory"
+    db_path = memory_dir / "index" / "memory.sqlite"
+    import sqlite3
+    conn = sqlite3.connect(str(db_path))
+    total = conn.execute("SELECT COUNT(*) FROM dream_runs").fetchone()[0]
+    query = "SELECT dream_run_id, started_at, ended_at, status, facts_created, output_path FROM dream_runs"
+    params: list = []
+    if status:
+        query += " WHERE status = ?"
+        params.append(status)
+    query += " ORDER BY started_at DESC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    items = []
+    for row in rows:
+        started = row[1]
+        ended = row[2]
+        duration_s = None
+        if started and ended:
+            try:
+                from datetime import datetime
+                s = datetime.fromisoformat(started.replace("+00:00", "Z").replace("Z", "+00:00"))
+                e = datetime.fromisoformat(ended.replace("+00:00", "Z").replace("Z", "+00:00"))
+                duration_s = round((e - s).total_seconds(), 1)
+            except Exception:
+                pass
+        items.append({
+            "id": row[0],
+            "started_at": started,
+            "finished_at": ended,
+            "duration_s": duration_s,
+            "status": row[3],
+            "facts_extracted": row[4] or 0,
+            "report_path": row[5] or None,
+        })
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/api/dashboard/memory/dreamer/runs/{run_id}")
+async def get_memory_dreamer_run(request: Request, run_id: str):
+    """Full detail for one dream run. API.md §9."""
+    _require_token(request)
+    memory_dir = get_hermes_home() / "memory"
+    db_path = memory_dir / "index" / "memory.sqlite"
+    import sqlite3, json
+    conn = sqlite3.connect(str(db_path))
+    row = conn.execute(
+        "SELECT dream_run_id, started_at, ended_at, status, facts_created, "
+        "decisions_created, questions_created, input_scope_json, output_path, "
+        "errors_json, llm_model, llm_endpoint FROM dream_runs WHERE dream_run_id = ?",
+        (run_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail={"detail": f"run {run_id} not found", "code": "RUN_NOT_FOUND"})
+    started, ended = row[1], row[2]
+    duration_s = None
+    if started and ended:
+        try:
+            from datetime import datetime
+            s = datetime.fromisoformat(started.replace("+00:00", "Z").replace("Z", "+00:00"))
+            e = datetime.fromisoformat(ended.replace("+00:00", "Z").replace("Z", "+00:00"))
+            duration_s = round((e - s).total_seconds(), 1)
+        except Exception:
+            pass
+    errors = None
+    if row[9]:
+        try:
+            errors = json.loads(row[9])
+        except Exception:
+            errors = row[9]
+    return {
+        "id": row[0],
+        "started_at": started,
+        "finished_at": ended,
+        "duration_s": duration_s,
+        "status": row[3],
+        "facts_extracted": row[4] or 0,
+        "decisions_extracted": row[5] or 0,
+        "open_questions_extracted": row[6] or 0,
+        "turns_processed": 0,
+        "embed_calls": 0,
+        "llm_tokens_in": 0,
+        "llm_tokens_out": 0,
+        "report_path": row[8] or None,
+        "report_available": bool(row[8]),
+        "error_message": errors if isinstance(errors, str) else None,
+    }
+
+
+@app.get("/api/dashboard/memory/dreamer/runs/{run_id}/report")
+async def get_memory_dreamer_report(request: Request, run_id: str):
+    """Markdown report for one run. API.md §10."""
+    _require_token(request)
+    memory_dir = get_hermes_home() / "memory"
+    db_path = memory_dir / "index" / "memory.sqlite"
+    import sqlite3
+    conn = sqlite3.connect(str(db_path))
+    row = conn.execute(
+        "SELECT output_path FROM dream_runs WHERE dream_run_id = ?", (run_id,)
+    ).fetchone()
+    conn.close()
+    if not row or not row[0]:
+        raise HTTPException(status_code=404, detail={"detail": "report not found", "code": "REPORT_MISSING"})
+    report_path = Path(row[0])
+    if not report_path.exists():
+        raise HTTPException(status_code=404, detail={"detail": "report file missing", "code": "REPORT_MISSING"})
+    content = report_path.read_text()
+    size_bytes = len(content.encode())
+    if size_bytes > 1_000_000:
+        content = content[:1_000_000] + "\n[truncated — file too large]"
+    return {"run_id": run_id, "path": str(report_path), "report_md": content, "size_bytes": size_bytes}
+
+
+@app.get("/api/dashboard/memory/dreamer/schedule")
+async def get_memory_dreamer_schedule(request: Request):
+    """systemd timer status. API.md §11."""
+    _require_token(request)
+    import subprocess
+    try:
+        res = subprocess.run(
+            ["systemctl", "list-timers", "--no-pager", "hermes-memory-dream.timer"],
+            capture_output=True, text=True, timeout=10,
+        )
+        output = res.stdout + res.stderr
+        timer_found = "hermes-memory-dream.timer" in output
+        enabled = "enabled" in output.lower()
+        active = "active" in output.lower()
+        # Parse next run time from list-timers output
+        next_run_at = None
+        for line in output.split("\n"):
+            if "hermes-memory-dream.timer" in line:
+                parts = line.split()
+                # Try to find an ISO timestamp
+                for p in parts:
+                    if "T" in p or "-" in p:
+                        next_run_at = p
+                        break
+                break
+        return {
+            "supported": True,
+            "timer": "hermes-memory-dream.timer",
+            "service": "hermes-memory-dream.service",
+            "enabled": enabled,
+            "active": active,
+            "next_run_at": next_run_at,
+            "last_run_at": None,
+        }
+    except FileNotFoundError:
+        return {"supported": False, "reason": "systemctl not available"}
+    except subprocess.TimeoutExpired:
+        return {"supported": False, "reason": "systemctl timed out"}
+    except Exception as exc:
+        _log.warning("dreamer/schedule failed: %s", exc)
+        return {"supported": False, "reason": str(exc)}
+
+
+@app.post("/api/dashboard/memory/dreamer/run-now")
+async def post_memory_dreamer_run_now(request: Request, since_hours: int = 24, force: bool = False):
+    """Trigger dreamer immediately. API.md §12."""
+    _require_token(request)
+    memory_dir = get_hermes_home() / "memory"
+    db_path = memory_dir / "index" / "memory.sqlite"
+    import sqlite3
+    conn = sqlite3.connect(str(db_path))
+    running = conn.execute(
+        "SELECT dream_run_id FROM dream_runs WHERE status = 'running' LIMIT 1"
+    ).fetchone()
+    conn.close()
+    if running:
+        raise HTTPException(
+            status_code=409,
+            detail={"detail": "dreamer already running", "code": "ALREADY_RUNNING", "job_id": running[0]},
+        )
+    import subprocess, uuid
+    job_id = f"dream-run-{uuid.uuid4().hex[:12]}"
+    started_at = _memory_now_iso()
+    venv_python = get_hermes_home().parent / "hermes-agent" / "venv" / "bin" / "python"
+    if not venv_python.exists():
+        venv_python = Path(sys.executable)
+    proc = subprocess.Popen(
+        [str(venv_python), "-m", "hermes_memory_core.dream", "--scope", "since_last"],
+        cwd=str(get_hermes_home().parent / "hermes-agent"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return {
+        "job_id": job_id,
+        "started_at": started_at,
+        "status_url": f"/api/actions/{job_id}/status",
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Memory dashboard — M3 Search + Activity  (API.md §13-§15)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.post("/api/dashboard/memory/search")
+async def post_memory_search(request: Request):
+    """Interactive memory search. API.md §13."""
+    _require_token(request)
+    body = await request.json()
+    query = body.get("query", "")
+    if not query or len(query) > 1000:
+        raise HTTPException(status_code=400, detail={"detail": "query must be 1-1000 chars", "code": "BAD_QUERY"})
+    mode = body.get("mode", "hybrid")
+    limit = min(int(body.get("limit", 10)), 100)
+    min_score = float(body.get("min_score", 0.0))
+    if mode not in ("hybrid", "semantic", "keyword", "facts"):
+        raise HTTPException(status_code=400, detail={"detail": f"unknown mode: {mode}", "code": "BAD_MODE"})
+    import time
+    t0 = time.time()
+    memory_dir = get_hermes_home() / "memory"
+    db_path = memory_dir / "index" / "memory.sqlite"
+    import sqlite3
+    conn = sqlite3.connect(str(db_path))
+    hits = []
+    if mode == "keyword":
+        rows = conn.execute(
+            "SELECT fact_id, fact_text, scope, source_refs_json FROM facts "
+            "WHERE fact_text LIKE ? ORDER BY RANDOM() LIMIT ?",
+            (f"%{query}%", limit)
+        ).fetchall()
+        for row in rows:
+            refs_json = row[3] or "[]"
+            import json as _json
+            try:
+                refs = _json.loads(refs_json)
+            except Exception:
+                refs = []
+            hits.append({
+                "score": 1.0,
+                "source": "sqlite",
+                "text": row[1][:200],
+                "session_id": refs[0].split(":")[0] if refs else None,
+                "turn_id": refs[0] if refs else None,
+                "timestamp": None,
+            })
+    elif mode == "facts":
+        rows = conn.execute(
+            "SELECT fact_id, fact_text, scope FROM facts "
+            "WHERE fact_text LIKE ? ORDER BY RANDOM() LIMIT ?",
+            (f"%{query}%", limit)
+        ).fetchall()
+        for row in rows:
+            hits.append({
+                "score": 1.0,
+                "source": "facts",
+                "text": row[1][:200],
+                "session_id": None,
+                "turn_id": row[0],
+                "timestamp": None,
+            })
+    else:
+        # hybrid/semantic — fall back to keyword for now (Qdrant requires embeddings)
+        rows = conn.execute(
+            "SELECT fact_id, fact_text, scope FROM facts "
+            "WHERE fact_text LIKE ? ORDER BY RANDOM() LIMIT ?",
+            (f"%{query}%", limit)
+        ).fetchall()
+        for row in rows:
+            hits.append({
+                "score": 0.7,
+                "source": "sqlite",
+                "text": row[1][:200],
+                "session_id": None,
+                "turn_id": row[0],
+                "timestamp": None,
+            })
+    conn.close()
+    elapsed_ms = round((time.time() - t0) * 1000)
+    return {
+        "query": query,
+        "mode": mode,
+        "elapsed_ms": elapsed_ms,
+        "embed_calls": 0,
+        "embed_ms": 0,
+        "hits": hits,
+    }
+
+
+@app.get("/api/dashboard/memory/activity")
+async def get_memory_activity(
+    request: Request,
+    limit: int = 50,
+    offset: int = 0,
+    since: Optional[str] = None,
+    kinds: Optional[str] = None,
+):
+    """Paginated activity feed. API.md §14."""
+    _require_token(request)
+    memory_dir = get_hermes_home() / "memory"
+    db_path = memory_dir / "index" / "memory.sqlite"
+    import sqlite3
+    conn = sqlite3.connect(str(db_path))
+    total = conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
+    query = "SELECT audit_id, timestamp, actor, action, target_kind, target_id, detail_json FROM audit_log"
+    cond, params = [], []
+    if since:
+        query += " WHERE timestamp >= ?"
+        params.append(since)
+    if kinds:
+        ks = kinds.split(",")
+        placeholders = ",".join("?" * len(ks))
+        if since:
+            query += f" AND action IN ({placeholders})"
+        else:
+            query += f" WHERE action IN ({placeholders})"
+        params.extend(k for k in ks)
+    query += " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    items = []
+    for row in rows:
+        import json as _json
+        detail = None
+        if row[6]:
+            try:
+                detail = _json.loads(row[6])
+            except Exception:
+                detail = row[6]
+        items.append({
+            "id": str(row[0]),
+            "timestamp": row[1],
+            "kind": row[3],
+            "source": row[2] or "agent",
+            "summary": f"{row[2] or 'agent'} {row[3]} {row[4] or ''}",
+            "session_id": None,
+            "details": detail,
+        })
+    return {"items": items, "total": total}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Memory dashboard — M4 Entities / Contradictions / Backup / Qdrant  (API.md §16-§19)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/dashboard/memory/entities")
+async def get_memory_entities(request: Request, limit: int = 10, sort: str = "count"):
+    """Top entities by fact count. API.md §16."""
+    _require_token(request)
+    memory_dir = get_hermes_home() / "memory"
+    db_path = memory_dir / "index" / "memory.sqlite"
+    import sqlite3
+    conn = sqlite3.connect(str(db_path))
+    if sort == "count":
+        rows = conn.execute(
+            "SELECT e.name, COUNT(fe.fact_id) as fact_count "
+            "FROM entities e LEFT JOIN fact_entities fe ON e.entity_id = fe.entity_id "
+            "GROUP BY e.entity_id, e.name ORDER BY fact_count DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT e.name, COUNT(fe.fact_id) as fact_count "
+            "FROM entities e LEFT JOIN fact_entities fe ON e.entity_id = fe.entity_id "
+            "GROUP BY e.entity_id, e.name ORDER BY e.name LIMIT ?",
+            (limit,)
+        ).fetchall()
+    total = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+    conn.close()
+    return {
+        "items": [{"entity": r[0], "fact_count": r[1]} for r in rows],
+        "total": total,
+    }
+
+
+@app.get("/api/dashboard/memory/contradictions")
+async def get_memory_contradictions(request: Request):
+    """Facts flagged as contradictory. API.md §17."""
+    _require_token(request)
+    memory_dir = get_hermes_home() / "memory"
+    db_path = memory_dir / "index" / "memory.sqlite"
+    import sqlite3
+    conn = sqlite3.connect(str(db_path))
+    # Contradictions are detected via supersedes/superseded_by chain
+    rows = conn.execute(
+        "SELECT f1.fact_id, f1.fact_text, f2.fact_id, f2.fact_text, f1.confidence, f2.confidence "
+        "FROM facts f1, facts f2 "
+        "WHERE f2.supersedes_fact_id = f1.fact_id "
+        "LIMIT 50"
+    ).fetchall()
+    conn.close()
+    items = []
+    for row in rows:
+        items.append({
+            "fact_a": {"id": row[0], "text": row[1][:200], "trust": row[4] or 0.5, "source_turn": None},
+            "fact_b": {"id": row[2], "text": row[3][:200], "trust": row[5] or 0.5, "source_turn": None},
+            "detected_in_run": None,
+            "detected_at": None,
+        })
+    return {"items": items, "total": len(items)}
+
+
+@app.post("/api/dashboard/memory/backup")
+async def post_memory_backup(request: Request, label: Optional[str] = None):
+    """Snapshot memory DB. API.md §18."""
+    _require_token(request)
+    import subprocess, datetime, tarfile, io, os
+    memory_dir = get_hermes_home() / "memory"
+    db_path = memory_dir / "index" / "memory.sqlite"
+    metrics_path = memory_dir / "metrics.json"
+    backup_dir = memory_dir / "backups"
+    backup_dir.mkdir(exist_ok=True)
+    ts = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%S")
+    label_str = f"_{label}" if label else ""
+    tar_path = backup_dir / f"{ts}{label_str}.tar.zst"
+    import asyncio
+    async def _backup():
+        proc = await asyncio.create_subprocess_exec(
+            "tar", "--zstd", "-cf", str(tar_path),
+            "-C", str(memory_dir),
+            "index/memory.sqlite",
+            "metrics.json",
+            stderr=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        return proc.returncode
+    code = await _backup()
+    if code != 0 or not tar_path.exists():
+        raise HTTPException(status_code=503, detail={"detail": "backup failed", "code": "BACKUP_FAILED"})
+    size_bytes = tar_path.stat().st_size
+    return {"ok": True, "path": str(tar_path), "size_bytes": size_bytes, "duration_s": None}
+
+
+@app.post("/api/dashboard/memory/qdrant/reinit")
+async def post_memory_qdrant_reinit(request: Request, force: bool = False, confirm: Optional[str] = None):
+    """Re-init Qdrant collections. API.md §19."""
+    _require_token(request)
+    if force:
+        if confirm != "RESET":
+            raise HTTPException(status_code=400, detail={"detail": "confirm must be 'RESET' when force=true", "code": "CONFIRM_REQUIRED"})
+    client = _memory_qdrant_client()
+    if client is None:
+        raise HTTPException(status_code=503, detail={"detail": "qdrant_client not available", "code": "QDRANT_UNAVAILABLE"})
+    collections = ["hermes_memory_facts", "hermes_memory_chunks", "hermes_memory_summaries"]
+    errors = []
+    for cname in collections:
+        try:
+            if force:
+                try:
+                    client.delete_collection(cname)
+                except Exception:
+                    pass
+            if not client.collection_exists(cname):
+                client.create_collection(cname, vectors_config={"size": 1536, "distance": "Cosine"})
+        except Exception as exc:
+            errors.append(str(exc))
+    return {"status": "created" if not errors else "partial", "collections": collections, "errors": errors}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Memory dashboard — Graph stats  (knowledge graph overview)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/dashboard/memory/graph/stats")
+async def get_memory_graph_stats(request: Request):
+    """Aggregate stats about the knowledge graph. Returns counts from all graph tables."""
+    _require_token(request)
+    memory_dir = get_hermes_home() / "memory"
+    db_path = memory_dir / "index" / "memory.sqlite"
+    import sqlite3
+    conn = sqlite3.connect(str(db_path))
+    facts_total = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+    facts_active = conn.execute("SELECT COUNT(*) FROM facts WHERE status = 'active'").fetchone()[0]
+    entities_total = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+    entity_relations_total = conn.execute("SELECT COUNT(*) FROM entity_relations").fetchone()[0]
+    fact_links_total = conn.execute("SELECT COUNT(*) FROM fact_links").fetchone()[0]
+    fact_entities_total = conn.execute("SELECT COUNT(*) FROM fact_entities").fetchone()[0]
+    top_entities = conn.execute(
+        "SELECT e.name, COUNT(fe.fact_id) as cnt "
+        "FROM entities e LEFT JOIN fact_entities fe ON e.entity_id = fe.entity_id "
+        "GROUP BY e.entity_id, e.name ORDER BY cnt DESC LIMIT 20"
+    ).fetchall()
+    conn.close()
+    return {
+        "facts": {"total": facts_total, "active": facts_active},
+        "entities": {"total": entities_total},
+        "entity_relations": {"total": entity_relations_total},
+        "fact_links": {"total": fact_links_total},
+        "fact_entities": {"total": fact_entities_total},
+        "top_entities": [{"entity": r[0], "fact_count": r[1]} for r in top_entities],
+    }
+
+
+# Memory dashboard — Graph full (node + edge data for force graph)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/dashboard/memory/graph/full")
+async def get_memory_graph_full(request: Request):
+    """Return full graph data: nodes (entities) + edges (relations) for force-graph visualization."""
+    _require_token(request)
+    memory_dir = get_hermes_home() / "memory"
+    db_path = memory_dir / "index" / "memory.sqlite"
+    import sqlite3
+    conn = sqlite3.connect(str(db_path))
+
+    # Nodes: entities with degree (connection count) for sizing
+    # Limit to top 300 entities by degree to keep graph interactive
+    nodes_raw = conn.execute("""
+        SELECT e.entity_id, e.name, e.entity_type,
+               COUNT(r.source_entity_id) + COUNT(r2.target_entity_id) as degree
+        FROM entities e
+        LEFT JOIN entity_relations r ON e.entity_id = r.source_entity_id
+        LEFT JOIN entity_relations r2 ON e.entity_id = r2.target_entity_id
+        GROUP BY e.entity_id
+        ORDER BY degree DESC
+        LIMIT 300
+    """).fetchall()
+
+    entity_name_map = {r[0]: r[1] for r in nodes_raw}
+
+    # Build nodes — size proportional to degree
+    max_degree = max(r[3] for r in nodes_raw) if nodes_raw else 1
+    nodes = []
+    for entity_id, name, entity_type, degree in nodes_raw:
+        norm = degree / max_degree if max_degree > 0 else 0
+        nodes.append({
+            "id": entity_id,
+            "name": name,
+            "type": entity_type or "concept",
+            "val": max(1, int(degree ** 0.5) + 1),  # size for graph
+            "degree": degree,
+            "color": _entity_type_color(entity_type or "concept"),
+        })
+
+    # Edges: entity relations
+    edges_raw = conn.execute("""
+        SELECT source_entity_id, target_entity_id, relation_type, confidence
+        FROM entity_relations
+        WHERE source_entity_id IN (
+            SELECT entity_id FROM entities ORDER BY entity_id
+        )
+        AND target_entity_id IN (
+            SELECT entity_id FROM entities ORDER BY entity_id
+        )
+    """).fetchall()
+
+    edges = []
+    for src, tgt, rel_type, conf in edges_raw:
+        if src in entity_name_map and tgt in entity_name_map:
+            edges.append({
+                "source": src,
+                "target": tgt,
+                "relation": rel_type,
+                "weight": conf,
+            })
+
+    conn.close()
+    return {"nodes": nodes, "links": edges}
+
+
+def _entity_type_color(entity_type: str) -> str:
+    """Return a hex color for entity type (matches the screenshot clusters)."""
+    palette = {
+        "person":    "#f97316",   # orange/red
+        "org":       "#eab308",   # yellow/gold
+        "tech":      "#06b6d4",   # teal/cyan
+        "product":   "#a855f7",   # purple
+        "product_code": "#a855f7",
+        "gpe":       "#22c55e",   # green
+        "date":      "#ec4899",   # pink
+        "law":       "#3b82f6",   # blue
+        "work_of_art": "#14b8a6", # teal
+        "currency":  "#eab308",    # gold
+        "url":       "#3b82f6",    # blue
+        "email":     "#64748b",   # slate
+        "unknown":   "#64748b",   # slate
+        "default":   "#64748b",   # slate
+    }
+    return palette.get(entity_type.lower(), palette["default"])
+
+
+    """Import and mount backend API routes from plugins that declare them.
+
+    Each plugin's ``api`` field points to a Python file that must expose
+    a ``router`` (FastAPI APIRouter).  Routes are mounted under
+    ``/api/plugins/<name>/``.
+
+    Backend import is restricted to ``bundled`` and ``user`` sources.
+    Project plugins (``./.hermes/plugins/``) ship with the CWD and are
+    therefore attacker-controlled in any threat model where the user
+    opens a malicious repo; they can extend the dashboard UI via
+    static JS/CSS but their Python ``api`` file is never auto-imported
+    by the web server.  See GHSA-5qr3-c538-wm9j (#29156).
+    """
+    for plugin in _get_dashboard_plugins():
+        api_file_name = plugin.get("_api_file")
+        if not api_file_name:
+            continue
+        if plugin.get("source") == "project":
+            _log.warning(
+                "Plugin %s: ignoring backend api=%s (project plugins may "
+                "not auto-import Python code; move the plugin to "
+                "~/.hermes/plugins/ if you trust it)",
+                plugin["name"], api_file_name,
+            )
+            continue
+        dashboard_dir = Path(plugin["_dir"])
+        api_path = dashboard_dir / api_file_name
+        try:
+            resolved_api = api_path.resolve()
+            resolved_base = dashboard_dir.resolve()
+            resolved_api.relative_to(resolved_base)
+        except (OSError, RuntimeError, ValueError):
+            # Discovery already filters this, but re-check here in case
+            # ``_dir`` was tampered with after caching or a future caller
+            # bypasses the validator.  Defence in depth keeps the import
+            # primitive contained even if the upstream check regresses.
+            _log.warning(
+                "Plugin %s: refusing to import api file outside its "
+                "dashboard directory (%s)", plugin["name"], api_path,
+            )
+            continue
+        if not api_path.exists():
+            _log.warning("Plugin %s declares api=%s but file not found", plugin["name"], api_file_name)
+            continue
+        try:
+            module_name = f"hermes_dashboard_plugin_{plugin['name']}"
+            spec = importlib.util.spec_from_file_location(module_name, api_path)
+            if spec is None or spec.loader is None:
+                continue
+            mod = importlib.util.module_from_spec(spec)
+            # Register in sys.modules BEFORE exec_module so pydantic/FastAPI
+            # can resolve forward references (e.g. models defined in a file
+            # that uses `from __future__ import annotations`). Without this,
+            # TypeAdapter lazy-build fails at first request with
+            # "is not fully defined" because the module namespace isn't
+            # reachable by name for string-annotation resolution.
+            sys.modules[module_name] = mod
+            try:
+                spec.loader.exec_module(mod)
+            except Exception:
+                sys.modules.pop(module_name, None)
+                raise
+            router = getattr(mod, "router", None)
+            if router is None:
+                _log.warning("Plugin %s api file has no 'router' attribute", plugin["name"])
+                continue
+            app.include_router(router, prefix=f"/api/plugins/{plugin['name']}")
+            _log.info("Mounted plugin API routes: /api/plugins/%s/", plugin["name"])
+        except Exception as exc:
+            _log.warning("Failed to load plugin %s API routes: %s", plugin["name"], exc)
+
+
 # Mount plugin API routes before the SPA catch-all.
 _mount_plugin_api_routes()
 

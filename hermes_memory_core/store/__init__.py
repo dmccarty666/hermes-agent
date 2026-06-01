@@ -1,0 +1,1 @@
+"""Store — SQLite, Qdrant, and filesystem persistence."""

@@ -104,7 +104,7 @@ PROJECTS_DIR = Path(HERMES_HOME) / "memory" / "projects"
 # ── LLM config ───────────────────────────────────────────────────────────────
 
 DREAM_LLM_URL     = "http://192.168.2.105:1234/v1"
-DREAM_LLM_MODEL   = "qwen3.6-35b-instruct"
+DREAM_LLM_MODEL   = "qwen/qwen3.6-35b-a3b"
 LMS_TIMEOUT       = 300.0
 MAX_LLM_RETRIES   = 2
 RETRY_BASE_DELAY = 5.0

@@ -529,7 +529,215 @@ export const api = {
       `/api/dashboard/memory/backends/${encodeURIComponent(name)}/ping`,
       { method: "POST" },
     ),
+
+  // Graph stats (knowledge graph overview)
+  getMemoryGraphStats: () =>
+    fetchJSON<MemoryGraphStatsResponse>("/api/dashboard/memory/graph/stats"),
+
+  // Graph full (node + edge data for force-graph visualization)
+  getMemoryGraphFull: () =>
+    fetchJSON<MemoryGraphFullResponse>("/api/dashboard/memory/graph/full"),
+
+  // M2 Dreamer
+  getMemoryDreamerLast: () =>
+    fetchJSON<MemoryDreamerRun>("/api/dashboard/memory/dreamer/last"),
+  getMemoryDreamerRuns: (params?: { limit?: number; offset?: number; status?: string }) => {
+    const qs = new URLSearchParams();
+    if (params?.limit != null) qs.set("limit", String(params.limit));
+    if (params?.offset != null) qs.set("offset", String(params.offset));
+    if (params?.status) qs.set("status", params.status);
+    const query = qs.toString();
+    return fetchJSON<MemoryDreamerRunsResponse>(
+      `/api/dashboard/memory/dreamer/runs${query ? `?${query}` : ""}`
+    );
+  },
+  getMemoryDreamerRun: (id: string) =>
+    fetchJSON<MemoryDreamerRun>(`/api/dashboard/memory/dreamer/runs/${encodeURIComponent(id)}`),
+  getMemoryDreamerReport: (id: string) =>
+    fetchJSON<MemoryDreamerReportResponse>(
+      `/api/dashboard/memory/dreamer/runs/${encodeURIComponent(id)}/report`
+    ),
+  getMemoryDreamerSchedule: () =>
+    fetchJSON<MemoryDreamerScheduleResponse>("/api/dashboard/memory/dreamer/schedule"),
+  postMemoryDreamerRunNow: (sinceHours = 24) =>
+    fetchJSON<{ job_id: string; started_at: string; status_url: string }>(
+      `/api/dashboard/memory/dreamer/run-now?since_hours=${sinceHours}`,
+      { method: "POST" }
+    ),
+
+  // M3 Search + Activity
+  postMemorySearch: (body: {
+    query: string;
+    mode?: "hybrid" | "semantic" | "keyword" | "facts";
+    limit?: number;
+    min_score?: number;
+  }) =>
+    fetchJSON<MemorySearchResponse>("/api/dashboard/memory/search", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  getMemoryActivity: (params?: { limit?: number; offset?: number; since?: string; kinds?: string }) => {
+    const qs = new URLSearchParams();
+    if (params?.limit != null) qs.set("limit", String(params.limit));
+    if (params?.offset != null) qs.set("offset", String(params.offset));
+    if (params?.since) qs.set("since", params.since);
+    if (params?.kinds) qs.set("kinds", params.kinds);
+    const query = qs.toString();
+    return fetchJSON<MemoryActivityResponse>(
+      `/api/dashboard/memory/activity${query ? `?${query}` : ""}`
+    );
+  },
+
+  // M4 Entities / Contradictions / Backup
+  getMemoryEntities: (params?: { limit?: number; sort?: string }) => {
+    const qs = new URLSearchParams();
+    if (params?.limit != null) qs.set("limit", String(params.limit));
+    if (params?.sort) qs.set("sort", params.sort);
+    const query = qs.toString();
+    return fetchJSON<MemoryEntitiesResponse>(
+      `/api/dashboard/memory/entities${query ? `?${query}` : ""}`
+    );
+  },
+  getMemoryContradictions: () =>
+    fetchJSON<MemoryContradictionsResponse>("/api/dashboard/memory/contradictions"),
+  postMemoryBackup: (label?: string) =>
+    fetchJSON<{ ok: boolean; path: string; size_bytes: number; duration_s: number | null }>(
+      `/api/dashboard/memory/backup${label ? `?label=${encodeURIComponent(label)}` : ""}`,
+      { method: "POST" }
+    ),
 };
+
+// Graph stats response
+export interface MemoryGraphStatsResponse {
+  facts: { total: number; active: number };
+  entities: { total: number };
+  entity_relations: { total: number };
+  fact_links: { total: number };
+  fact_entities: { total: number };
+  top_entities: Array<{ entity: string; fact_count: number }>;
+}
+
+// Graph full response (node + edge data for force-graph)
+export interface MemoryGraphFullNode {
+  id: string;
+  name: string;
+  type: string;
+  val: number;
+  degree: number;
+  color: string;
+}
+
+export interface MemoryGraphFullLink {
+  source: string;
+  target: string;
+  relation: string;
+  weight: number;
+}
+
+export interface MemoryGraphFullResponse {
+  nodes: MemoryGraphFullNode[];
+  links: MemoryGraphFullLink[];
+}
+
+// M2 Dreamer types
+export interface MemoryDreamerRun {
+  id: string;
+  started_at: string;
+  finished_at: string | null;
+  duration_s: number | null;
+  status: string;
+  facts_extracted: number;
+  decisions_extracted: number;
+  open_questions_extracted: number;
+  turns_processed: number;
+  embed_calls: number;
+  llm_tokens_in: number;
+  llm_tokens_out: number;
+  report_path: string | null;
+  report_available: boolean;
+  error_message: string | null;
+}
+
+export interface MemoryDreamerRunsResponse {
+  items: Array<{
+    id: string;
+    started_at: string;
+    finished_at: string | null;
+    duration_s: number | null;
+    status: string;
+    facts_extracted: number;
+    report_path: string | null;
+  }>;
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface MemoryDreamerReportResponse {
+  run_id: string;
+  path: string;
+  report_md: string;
+  size_bytes: number;
+}
+
+export interface MemoryDreamerScheduleResponse {
+  supported: boolean;
+  timer?: string;
+  service?: string;
+  enabled?: boolean;
+  active?: boolean;
+  next_run_at?: string | null;
+  last_run_at?: string | null;
+  reason?: string;
+}
+
+// M3 Search types
+export interface MemorySearchResponse {
+  query: string;
+  mode: string;
+  elapsed_ms: number;
+  embed_calls: number;
+  embed_ms: number;
+  hits: Array<{
+    score: number;
+    source: string;
+    text: string;
+    session_id: string | null;
+    turn_id: string | null;
+    timestamp: string | null;
+  }>;
+}
+
+// M3 Activity types
+export interface MemoryActivityResponse {
+  items: Array<{
+    id: string;
+    timestamp: string;
+    kind: string;
+    source: string;
+    summary: string;
+    session_id: string | null;
+    details: Record<string, unknown> | null;
+  }>;
+  total: number;
+}
+
+// M4 Entities types
+export interface MemoryEntitiesResponse {
+  items: Array<{ entity: string; fact_count: number }>;
+  total: number;
+}
+
+// M4 Contradictions types
+export interface MemoryContradictionsResponse {
+  items: Array<{
+    fact_a: { id: string; text: string; trust: number; source_turn: string | null };
+    fact_b: { id: string; text: string; trust: number; source_turn: string | null };
+    detected_in_run: string | null;
+    detected_at: string | null;
+  }>;
+  total: number;
+}
 
 /** Identity payload returned by ``GET /api/auth/me`` (Phase 7).
  *

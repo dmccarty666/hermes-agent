@@ -19,6 +19,7 @@ class TemporalEdge:
     source_entity: str
     target_entity: str
     relation_type: str  # e.g., "evolved_from", "renamed_to", "merged_into"
+    confidence: float = 1.0
 
 
 # Patterns for detecting versioned entities

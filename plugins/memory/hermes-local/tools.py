@@ -349,8 +349,9 @@ def _handle_memory_query(params: dict[str, Any]) -> dict[str, Any]:
     # response.
     if mode in ("semantic", "hybrid"):
         try:
-            from hermes_memory_core.search import hybrid as _hybrid
-            raw = _hybrid.search(query, mode=mode, limit=limit, memory_db=store)
+            from hermes_memory_core.search.hybrid import HybridScorer
+            scorer = HybridScorer()
+            raw = scorer.search(query, mode=mode, limit=limit)
             # hybrid.search returns dict {"results": [...], "count": N, ...}
             raw_hits = raw.get("results") if isinstance(raw, dict) else raw
             raw_hits = raw_hits or []
@@ -359,6 +360,9 @@ def _handle_memory_query(params: dict[str, Any]) -> dict[str, Any]:
             # min_score). Real hits are typically 0.40+; junk hits 0.20-.
             def _score_of(h):
                 try:
+                    # ScoredResult dataclass has .score attr; dicts use .get()
+                    if hasattr(h, "score"):
+                        return float(h.score)
                     return float(h.get("score", 0.0)) if isinstance(h, dict) else 0.0
                 except (TypeError, ValueError):
                     return 0.0

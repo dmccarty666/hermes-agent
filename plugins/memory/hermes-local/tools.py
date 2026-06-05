@@ -362,8 +362,13 @@ def _handle_memory_query(params: dict[str, Any]) -> dict[str, Any]:
             # Filter out low-confidence vector noise (cosine similarity below
             # min_score). Real hits are typically 0.40+; junk hits 0.20-.
             def _score_of(h):
+                """Extract score, handling both dicts and ScoredResult dataclasses."""
                 try:
-                    return float(h.get("score", 0.0)) if isinstance(h, dict) else 0.0
+                    if isinstance(h, dict):
+                        return float(h.get("score", 0.0))
+                    elif hasattr(h, "score"):
+                        return float(h.score)
+                    return 0.0
                 except (TypeError, ValueError):
                     return 0.0
 
